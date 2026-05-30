@@ -1,0 +1,16 @@
+# Software Information
+display_name = "libretrocore"
+authors = "shinkarom"
+supported_extensions = "cart"
+corename = "libretrocore"
+categories = "Core"
+license = "GPL 3.0"
+permissions = ""
+display_version = "v1.0"
+
+# Hardware Information
+
+# Libretro Features
+supports_no_game = "false"
+
+description = "Libretro core."
