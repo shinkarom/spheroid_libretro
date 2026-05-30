@@ -1,8 +1,8 @@
 # CMake 3.20 is required for proper C++23 support
 cmake_minimum_required(VERSION 3.20)
 
-set(LIBNAME libretrocore)
-project(${LIBNAME} LANGUAGES C CXX VERSION 1.0.1 DESCRIPTION "Libretro C++ Core Template")
+set(LIBNAME spheroid_libretro)
+project(${LIBNAME} LANGUAGES C CXX VERSION 1.0.1 DESCRIPTION "Spheroid Libretro Core")
 
 # Default to Release build for maximum emulator performance
 if(NOT CMAKE_BUILD_TYPE)
@@ -21,6 +21,10 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
 # Remove the "lib" prefix so the output is "mycore_libretro.so/dll"
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
+# Add Unicorn submodule
+set(UNICORN_BUILD_SHARED OFF CACHE BOOL "" FORCE) # Force static build
+set(UNICORN_ARCH "aarch64" CACHE STRING "Architectures to build" FORCE)
+add_subdirectory(vendor/unicorn)
 # MUST be ON when linking a STATIC library into a SHARED library
 #set_target_properties(lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -37,5 +41,5 @@ set_target_properties(${LIBNAME} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin" # For Linux/macOS .so/.dylib
 )
 
-#target_link_libraries(${LIBNAME} PRIVATE lib)
-target_include_directories(${LIBNAME} PRIVATE src)
+target_link_libraries(${LIBNAME} PRIVATE unicorn)
+target_include_directories(${LIBNAME} PRIVATE src vendor/unicorn/include)

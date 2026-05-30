@@ -11,6 +11,7 @@
 #include <windows.h>
 #endif
 #include "libretro.h"
+#include <unicorn/unicorn.h>
 
 extern "C" {
 
@@ -28,6 +29,8 @@ static float last_aspect;
 static float last_sample_rate;
 char retro_base_directory[4096];
 char retro_game_path[4096];
+
+static uc_engine *uc;
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -50,12 +53,22 @@ RETRO_API void retro_init(void)
    {
       snprintf(retro_base_directory, sizeof(retro_base_directory), "%s", dir);
    }
-   
+   uc_err err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &uc);
+
+	if (err) {
+		// If you accidentally passed UC_ARCH_X86, or UC_ARCH_ARM, 
+		// it will fail here because those engines were not compiled!
+		printf("Failed on uc_open with error returned: %u\n", err);
+	}
 }
 
 RETRO_API void retro_deinit(void)
 {
    delete[] frame_buf;
+   if (uc) {
+        uc_close(uc);
+        uc = NULL;
+    }
 }
 
 RETRO_API unsigned retro_api_version(void)
