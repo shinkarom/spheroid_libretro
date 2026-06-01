@@ -1,5 +1,5 @@
 # Software Information
-display_name = "libretrocore"
+display_name = "Spheroid"
 authors = "shinkarom"
 supported_extensions = "cart"
 corename = "libretrocore"
@@ -13,4 +13,4 @@ display_version = "v1.0"
 # Libretro Features
 supports_no_game = "false"
 
-description = "Libretro core."
+description = "Spheroid fantasy console."

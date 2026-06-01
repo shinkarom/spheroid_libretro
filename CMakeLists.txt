@@ -28,7 +28,9 @@ add_subdirectory(vendor/unicorn)
 # MUST be ON when linking a STATIC library into a SHARED library
 #set_target_properties(lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(${LIBNAME} SHARED src/libretro.cpp)
+add_library(${LIBNAME} SHARED 
+	src/libretro.cpp
+	src/portablegl.c)
 
 # Embed MinGW standard libraries so Windows DLLs are completely portable
 if(MINGW)
