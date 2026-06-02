@@ -30,6 +30,7 @@ add_subdirectory(vendor/unicorn)
 
 add_library(${LIBNAME} SHARED 
 	src/libretro.cpp
+	src/gpu.cpp
 	)
 
 # Embed MinGW standard libraries so Windows DLLs are completely portable

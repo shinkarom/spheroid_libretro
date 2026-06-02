@@ -13,9 +13,9 @@
 #include <cstring>
 #define _USE_MATH_DEFINES
 #include <math.h>
-#include <algorithm>
-#include <cfloat>
 #include <elf.h>
+#include <gpu.hpp>
+#include <math3d.hpp>
 
 #if defined(_WIN32) && !defined(_XBOX)
 #include <windows.h>
@@ -31,10 +31,10 @@ extern "C" {
 // =============================================================================
 
 /* Spheroid Fantasy Console Target Resolution */
-constexpr unsigned SCREEN_WIDTH  = 640;
-constexpr unsigned SCREEN_HEIGHT = 480;
+constexpr unsigned SCREEN_WIDTH  = 320;
+constexpr unsigned SCREEN_HEIGHT = 240;
 constexpr unsigned TOTAL_PIXELS  = SCREEN_WIDTH * SCREEN_HEIGHT;
-constexpr float    ASPECT_RATIO  = 4.0f / 3.0f;
+constexpr float ASPECT_RATIO = 4.f / 3.0f;
 
 /* Audio Configuration */
 constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
@@ -76,62 +76,98 @@ struct CoreState {
 };
 static CoreState core_state = {0, 0.0};
 
-static float depth_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
+static SpheroidGPU gpu;
+
 static float rotation_3d = 0.0f;
+static Mesh demo_cube = []() {
+    Mesh m;
+    m.vertices = {
+        {-1, -1, -1}, { 1, -1, -1}, { 1,  1, -1}, {-1,  1, -1},
+        {-1, -1,  1}, { 1, -1,  1}, { 1,  1,  1}, {-1,  1,  1}
+    };
+    m.colors = {
+        {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0},
+        {255, 0, 255}, {0, 255, 255}, {255, 255, 255}, {128, 128, 128}
+    };
+    m.indices = {
+        0,1,2, 0,2,3,  1,5,6, 1,6,2,  5,4,7, 5,7,6,
+        4,0,3, 4,3,7,  3,2,6, 3,6,7,  4,5,1, 4,1,0 
+    };
+    return m;
+}();
 
-// 3D Structs
-struct Vec3 { float x, y, z; };
-struct SVertex { int x, y; float z; float r, g, b; };
+constexpr uint32_t VRAM_LIST_OFFSET   = 0x01000000; 
+constexpr uint32_t VRAM_VERTEX_OFFSET = 0x02000000; 
 
-// 2D Cross product for barycentric coordinates
-static int edge_cross(int x0, int y0, int x1, int y1, int x, int y) {
-    return (x - x0) * (y1 - y0) - (y - y0) * (x1 - x0);
-}
+// Change this number to stress the CPU! 
+// 512 cubes = 18,432 triangles per frame.
+constexpr int GRID_SIZE = 10; 
+constexpr int TOTAL_CUBES = GRID_SIZE * GRID_SIZE * GRID_SIZE; 
 
-static void draw_triangle_3d(SVertex v0, SVertex v1, SVertex v2) {
-    // 1. Calculate the signed area of the triangle
-    int area = edge_cross(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
+static void simulate_guest_game() {
+    rotation_3d += 0.02f;
     
-    // 2. BACKFACE CULLING: 
-    // If the area is negative (or zero), the triangle is facing away from us.
-    // (Note: If your cube suddenly turns invisible, change this to area >= 0)
-    if (area <= 0) return; 
+    GPUVertex* vram_verts = (GPUVertex*)&console_ram[VRAM_VERTEX_OFFSET];
+    uint32_t vertex_count = 0;
+    float fov = 1.2f;
 
-    // Bounding Box
-    int minX = std::max(0, std::min({v0.x, v1.x, v2.x}));
-    int minY = std::max(0, std::min({v0.y, v1.y, v2.y}));
-    int maxX = std::min((int)SCREEN_WIDTH - 1,  std::max({v0.x, v1.x, v2.x}));
-    int maxY = std::min((int)SCREEN_HEIGHT - 1, std::max({v0.y, v1.y, v2.y}));
+    // A camera matrix that pushes the whole cloud 20 units into the screen
+    // and slowly rotates the entire field.
+    Mat4 camera_mat = mat4_translation(0.0f, 0.0f, 20.0f) * 
+                      mat4_rotation(rotation_3d * 0.2f, rotation_3d * 0.3f, 0.0f);
 
-    for (int y = minY; y <= maxY; y++) {
-        for (int x = minX; x <= maxX; x++) {
-            
-            int w0 = edge_cross(v1.x, v1.y, v2.x, v2.y, x, y);
-            int w1 = edge_cross(v2.x, v2.y, v0.x, v0.y, x, y);
-            int w2 = edge_cross(v0.x, v0.y, v1.x, v1.y, x, y);
+    // 1. Generate the Asteroid Field
+    for (int i = 0; i < TOTAL_CUBES; i++) {
+        
+        // Calculate grid position (from -half to +half)
+        float x = (i % GRID_SIZE) - (GRID_SIZE / 2.0f);
+        float y = ((i / GRID_SIZE) % GRID_SIZE) - (GRID_SIZE / 2.0f);
+        float z = ((i / (GRID_SIZE * GRID_SIZE)) % GRID_SIZE) - (GRID_SIZE / 2.0f);
 
-            // Because we threw away backfaces, we only need to check if weights are positive!
-            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+        // Make them spin differently based on their position
+        float local_rot = rotation_3d * 2.0f + (x * 0.5f);
+
+        // Build the matrix for this specific cube
+        Mat4 model_mat = camera_mat * 
+                         mat4_translation(x * 2.5f, y * 2.5f, z * 2.5f) * 
+                         mat4_rotation(local_rot, local_rot, 0.0f) * 
+                         mat4_scale(0.4f);
+
+        // Project and write to VRAM
+        for (size_t j = 0; j < demo_cube.indices.size(); j += 3) {
+            for (int v = 0; v < 3; v++) {
+                int idx = demo_cube.indices[j + v];
+                Vec3 world = transform_vec3(model_mat, demo_cube.vertices[idx]);
                 
-                // Interpolate Z for the depth buffer
-                float z = (w0 * v0.z + w1 * v1.z + w2 * v2.z) / area;
-                int pixel_idx = y * SCREEN_WIDTH + x;
+                float depth = std::max(world.z, 0.1f); 
+                float xP = (world.x / depth) * fov;
+                float yP = (world.y / depth) * fov * ASPECT_RATIO;
 
-                // Depth Test
-                if (z < depth_buffer[pixel_idx]) {
-                    depth_buffer[pixel_idx] = z; // Write new Z
-
-                    // Interpolate RGB Colors
-                    int r = (w0 * v0.r + w1 * v1.r + w2 * v2.r) / area;
-                    int g = (w0 * v0.g + w1 * v1.g + w2 * v2.g) / area;
-                    int b = (w0 * v0.b + w1 * v1.b + w2 * v2.b) / area;
-
-                    // Write Pixel
-                    frame_buf[pixel_idx] = (255 << 24) | (r << 16) | (g << 8) | b;
-                }
+                vram_verts[vertex_count++] = {
+                    (xP + 1.0f) * 0.5f * SCREEN_WIDTH,
+                    (1.0f - yP) * 0.5f * SCREEN_HEIGHT,
+                    depth,
+                    demo_cube.colors[idx].r, demo_cube.colors[idx].g, demo_cube.colors[idx].b, 255
+                };
             }
         }
     }
+
+    // 2. Write Display List to RAM
+    uint32_t* cmd_list = (uint32_t*)&console_ram[VRAM_LIST_OFFSET];
+    uint32_t cmd_idx = 0;
+    
+    cmd_list[cmd_idx++] = 0x01; // CLEAR
+    cmd_list[cmd_idx++] = 0xFF101020; // Very Dark Blue
+    
+    cmd_list[cmd_idx++] = 0x04; // DRAW_ARRAYS
+    cmd_list[cmd_idx++] = VRAM_VERTEX_OFFSET;
+    cmd_list[cmd_idx++] = vertex_count;
+    
+    cmd_list[cmd_idx++] = 0xFF; // END LIST
+
+    // 3. Trigger GPU
+    gpu.execute_display_list(VRAM_LIST_OFFSET);
 }
 
 // =============================================================================
@@ -258,6 +294,9 @@ RETRO_API void retro_init(void)
         console_ram = nullptr;	
         return;
     }
+	
+	gpu.init(SCREEN_WIDTH, SCREEN_HEIGHT);
+	gpu.set_ram_pointer(console_ram);
 }
 
 RETRO_API void retro_deinit(void)
@@ -280,6 +319,7 @@ RETRO_API void retro_deinit(void)
         free(console_ram);
         console_ram = nullptr;
     }
+	 gpu.shutdown();
 }
 
 RETRO_API unsigned retro_api_version(void) { return RETRO_API_VERSION; }
@@ -361,7 +401,7 @@ RETRO_API void retro_run(void)
     // Parameters: engine, start_address, until_address, timeout (0=infinite), count (0=infinite)
     // For a game console, you usually run for a set number of instructions or until a specific "Yield" address.
     // For testing, we just run 2 instructions.
-    uc_err err = uc_emu_start(uc, current_pc, 0xFFFFFFFFFFFFFFFF , 0, 2000000);
+    uc_err err = uc_emu_start(uc, current_pc, 0xFFFFFFFFFFFFFFFF , 0, 1000);
 
     if (err) {
         // Write error to a file
@@ -372,78 +412,11 @@ RETRO_API void retro_run(void)
         }
     }
 
-   // 3. Software TBDR Rendering
-   // -> Your custom TBDR engine should draw its tiles into `frame_buf` here <-
-   for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
-        frame_buf[i] = 0xFF191933; // Dark Blue
-        depth_buffer[i] = FLT_MAX;    // Initialize Z-buffer to infinity
-    }
-
-    // 2. Define a 3D Cube (8 Vertices)
-    Vec3 verts[8] = {
-        {-1, -1, -1}, { 1, -1, -1}, { 1,  1, -1}, {-1,  1, -1}, // Back face
-        {-1, -1,  1}, { 1, -1,  1}, { 1,  1,  1}, {-1,  1,  1}  // Front face
-    };
-    Vec3 colors[8] = {
-        {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0},
-        {255, 0, 255}, {0, 255, 255}, {255, 255, 255}, {128, 128, 128}
-    };
-    int indices[36] = {
-        0,1,2, 0,2,3, // Back
-        1,5,6, 1,6,2, // Right
-        5,4,7, 5,7,6, // Front
-        4,0,3, 4,3,7, // Left
-        3,2,6, 3,6,7, // Top
-        4,5,1, 4,1,0  // Bottom
-    };
-
-    // 3. Transformation & Projection
-    rotation_3d += 0.02f;
-    float sX = sinf(rotation_3d * 0.7f), cX = cosf(rotation_3d * 0.7f);
-    float sY = sinf(rotation_3d),        cY = cosf(rotation_3d);
-
-    SVertex projected[8];
-    for (int i = 0; i < 8; i++) {
-        // Rotate around Y axis
-        float x1 = verts[i].x * cY - verts[i].z * sY;
-        float z1 = verts[i].x * sY + verts[i].z * cY;
-        float y1 = verts[i].y;
-
-        // Rotate around X axis
-        float y2 = y1 * cX - z1 * sX;
-        float z2 = y1 * sX + z1 * cX;
-        float x2 = x1;
-
-        // Push into the screen so we can see it
-        z2 += 6.0f; 
-
-        // Perspective Projection
-        float fov = 1.2f; 
-        float xProj = (x2 / z2) * fov;
-        float yProj = (y2 / z2) * fov * ((float)SCREEN_WIDTH / SCREEN_HEIGHT);
-
-        // Map to 2D Screen Space
-        projected[i].x = (int)((xProj + 1.0f) * 0.5f * SCREEN_WIDTH);
-        projected[i].y = (int)((1.0f - yProj) * 0.5f * SCREEN_HEIGHT);
-        projected[i].z = z2; // Save 3D depth for Z-buffer
-        
-        projected[i].r = colors[i].x;
-        projected[i].g = colors[i].y;
-        projected[i].b = colors[i].z;
-    }
-
-    // 4. Rasterize all 12 triangles
-    for (int i = 0; i < 36; i += 3) {
-        draw_triangle_3d(
-            projected[indices[i]], 
-            projected[indices[i+1]], 
-            projected[indices[i+2]]
-        );
-    }
+   simulate_guest_game();
    
    // Push the completed software frame to the frontend.
    // Pitch = the width of the screen multiplied by the size of a single pixel (4 bytes for XRGB8888).
-   video_cb(frame_buf, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(uint32_t));
+   video_cb(gpu.get_framebuffer(), SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(uint32_t));
 
    // 4. Audio Output
    int16_t audio_buf[SAMPLES_PER_FRAME * 2];
