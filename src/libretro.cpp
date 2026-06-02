@@ -40,6 +40,17 @@ constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
 constexpr unsigned FPS = 60;
 constexpr unsigned SAMPLES_PER_FRAME = AUDIO_SAMPLE_RATE / FPS; // 735 samples
 
+// Unicorn requires memory sizes and addresses to be multiples of 4KB (4096 bytes).
+// 128 MB is perfectly aligned (134,217,728 bytes).
+const uint32_t RAM_SIZE = 128 * 1024 * 1024;
+
+// Where does the RAM start in the emulated CPU's address space?
+// We use 0x10000000 to avoid Address 0 (which catches NULL pointer bugs in games).
+const uint64_t RAM_BASE_ADDRESS = 0x10000000;
+
+// The actual host memory block
+static uint8_t* console_ram = nullptr;
+
 static struct retro_log_callback logging;
 static retro_log_printf_t log_cb;
 
@@ -228,6 +239,24 @@ RETRO_API void retro_init(void)
       // Allocate context memory used for Save States
       uc_context_alloc(uc, &uc_ctx);
    }
+   
+   // 1. Allocate 128MB of memory and zero it out
+    console_ram = (uint8_t*)calloc(1, RAM_SIZE);
+    if (!console_ram) {
+        printf("Failed to allocate 128MB of host RAM!\n");
+        return; 
+    }
+
+    // 2. Map this exact pointer directly into the Unicorn Engine
+    // UC_PROT_ALL means the emulated CPU can Read, Write, and Execute code here.
+    err = uc_mem_map_ptr(uc, RAM_BASE_ADDRESS, RAM_SIZE, UC_PROT_ALL, console_ram);
+    
+    if (err != UC_ERR_OK) {
+        printf("Unicorn Failed to map memory: %s\n", uc_strerror(err));
+        free(console_ram);
+        console_ram = nullptr;	
+        return;
+    }
 }
 
 RETRO_API void retro_deinit(void)
@@ -244,6 +273,12 @@ RETRO_API void retro_deinit(void)
       uc_close(uc);
       uc = nullptr;
    }
+   if (console_ram) {
+        // Unicorn will unmap automatically when uc_close() is called,
+        // but we still need to free our host memory.
+        free(console_ram);
+        console_ram = nullptr;
+    }
 }
 
 RETRO_API unsigned retro_api_version(void) { return RETRO_API_VERSION; }
@@ -317,10 +352,24 @@ RETRO_API void retro_run(void)
    // 2. Emulate Frame (Unicorn Step)
    core_state.frame_count++;
    
-   if (uc) {
-      // Start execution. Replace addresses and cycles as needed.
-      // uc_err err = uc_emu_start(uc, current_ip, end_ip, 0, cycles_per_frame);
-   }
+   
+   uint64_t current_pc;
+    uc_reg_read(uc, UC_ARM64_REG_PC, &current_pc);
+	log_cb(RETRO_LOG_ERROR,"%X\n", current_pc);
+    // Run the ARM64 emulator!
+    // Parameters: engine, start_address, until_address, timeout (0=infinite), count (0=infinite)
+    // For a game console, you usually run for a set number of instructions or until a specific "Yield" address.
+    // For testing, we just run 2 instructions.
+    uc_err err = uc_emu_start(uc, current_pc, 1024, 0, 10000);
+
+    if (err) {
+        // Write error to a file
+        FILE* f = fopen("unicorn_debug.txt", "w");
+        if (f) {
+            fprintf(f, "CPU Crash: %s\n", uc_strerror(err));
+            fclose(f);
+        }
+    }
 
    // 3. Software TBDR Rendering
    // -> Your custom TBDR engine should draw its tiles into `frame_buf` here <-
@@ -467,6 +516,23 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info)
        delete[] rom_data;
    }
    */
+
+	// 1. Put some dummy ARM64 machine code into our RAM (at the beginning).
+    // In a real scenario, you would use fread() to load a game's ".bin" file into console_ram here.
+    
+    // This is ARM64 machine code for: 
+    // mov w0, #0x1234
+    // b .-4  
+    uint32_t boot_code[] = { 0x52a24680, 0x17ffffff   }; 
+    memcpy(&console_ram[0], boot_code, sizeof(boot_code));
+
+    // 2. Set the Stack Pointer (SP) to the very top of our 128MB RAM.
+    uint64_t sp_value = RAM_BASE_ADDRESS + RAM_SIZE;
+    uc_reg_write(uc, UC_ARM64_REG_SP, &sp_value);
+
+    // 3. Set the Program Counter (PC) to the start of our RAM (where our boot code is).
+    uint64_t pc_value = RAM_BASE_ADDRESS;
+    uc_reg_write(uc, UC_ARM64_REG_PC, &pc_value);
 
    // 4. Connect Keyboard Hook
    struct retro_keyboard_callback kb_cb = { keyboard_cb };
