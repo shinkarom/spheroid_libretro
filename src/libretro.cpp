@@ -15,6 +15,7 @@
 #include <math.h>
 #include <algorithm>
 #include <cfloat>
+#include <elf.h>
 
 #if defined(_WIN32) && !defined(_XBOX)
 #include <windows.h>
@@ -360,7 +361,7 @@ RETRO_API void retro_run(void)
     // Parameters: engine, start_address, until_address, timeout (0=infinite), count (0=infinite)
     // For a game console, you usually run for a set number of instructions or until a specific "Yield" address.
     // For testing, we just run 2 instructions.
-    uc_err err = uc_emu_start(uc, current_pc, 1024, 0, 10000);
+    uc_err err = uc_emu_start(uc, current_pc, 0xFFFFFFFFFFFFFFFF , 0, 2000000);
 
     if (err) {
         // Write error to a file
