@@ -13,6 +13,8 @@
 #include <cstring>
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <algorithm>
+#include <cfloat>
 
 #if defined(_WIN32) && !defined(_XBOX)
 #include <windows.h>
@@ -20,7 +22,6 @@
 
 #include "libretro.h"
 #include <unicorn/unicorn.h>
-#include "portablegl.h"
 
 extern "C" {
 
@@ -49,7 +50,6 @@ char retro_game_path[4096];
 // --- Software Rendering Buffer ---
 // 32-bit XRGB8888 buffer where your TBDR will draw its pixels.
 static uint32_t *frame_buf = nullptr;
-glContext the_Context;
 
 // --- Unicorn Engine Variables ---
 static uc_engine *uc = nullptr;
@@ -63,6 +63,64 @@ struct CoreState {
    // Add custom fantasy console hardware registers here (GPU regs, Audio regs, etc.)
 };
 static CoreState core_state = {0, 0.0};
+
+static float depth_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
+static float rotation_3d = 0.0f;
+
+// 3D Structs
+struct Vec3 { float x, y, z; };
+struct SVertex { int x, y; float z; float r, g, b; };
+
+// 2D Cross product for barycentric coordinates
+static int edge_cross(int x0, int y0, int x1, int y1, int x, int y) {
+    return (x - x0) * (y1 - y0) - (y - y0) * (x1 - x0);
+}
+
+static void draw_triangle_3d(SVertex v0, SVertex v1, SVertex v2) {
+    // 1. Calculate the signed area of the triangle
+    int area = edge_cross(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
+    
+    // 2. BACKFACE CULLING: 
+    // If the area is negative (or zero), the triangle is facing away from us.
+    // (Note: If your cube suddenly turns invisible, change this to area >= 0)
+    if (area <= 0) return; 
+
+    // Bounding Box
+    int minX = std::max(0, std::min({v0.x, v1.x, v2.x}));
+    int minY = std::max(0, std::min({v0.y, v1.y, v2.y}));
+    int maxX = std::min((int)SCREEN_WIDTH - 1,  std::max({v0.x, v1.x, v2.x}));
+    int maxY = std::min((int)SCREEN_HEIGHT - 1, std::max({v0.y, v1.y, v2.y}));
+
+    for (int y = minY; y <= maxY; y++) {
+        for (int x = minX; x <= maxX; x++) {
+            
+            int w0 = edge_cross(v1.x, v1.y, v2.x, v2.y, x, y);
+            int w1 = edge_cross(v2.x, v2.y, v0.x, v0.y, x, y);
+            int w2 = edge_cross(v0.x, v0.y, v1.x, v1.y, x, y);
+
+            // Because we threw away backfaces, we only need to check if weights are positive!
+            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+                
+                // Interpolate Z for the depth buffer
+                float z = (w0 * v0.z + w1 * v1.z + w2 * v2.z) / area;
+                int pixel_idx = y * SCREEN_WIDTH + x;
+
+                // Depth Test
+                if (z < depth_buffer[pixel_idx]) {
+                    depth_buffer[pixel_idx] = z; // Write new Z
+
+                    // Interpolate RGB Colors
+                    int r = (w0 * v0.r + w1 * v1.r + w2 * v2.r) / area;
+                    int g = (w0 * v0.g + w1 * v1.g + w2 * v2.g) / area;
+                    int b = (w0 * v0.b + w1 * v1.b + w2 * v2.b) / area;
+
+                    // Write Pixel
+                    frame_buf[pixel_idx] = (255 << 24) | (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Libretro Callbacks
@@ -266,21 +324,72 @@ RETRO_API void retro_run(void)
 
    // 3. Software TBDR Rendering
    // -> Your custom TBDR engine should draw its tiles into `frame_buf` here <-
-   
-   // 1. Calculate a changing color based on frames
-    float r = (sin(core_state.frame_count * 0.05f) + 1.0f) / 2.0f;
-    float g = (cos(core_state.frame_count * 0.03f) + 1.0f) / 2.0f;
-    float b = 0.5f;
+   for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
+        frame_buf[i] = 0xFF191933; // Dark Blue
+        depth_buffer[i] = FLT_MAX;    // Initialize Z-buffer to infinity
+    }
 
-    // 2. Use PortableGL (Standard OpenGL API) to clear the screen
-    glClearColor(r, g, b, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    // 2. Define a 3D Cube (8 Vertices)
+    Vec3 verts[8] = {
+        {-1, -1, -1}, { 1, -1, -1}, { 1,  1, -1}, {-1,  1, -1}, // Back face
+        {-1, -1,  1}, { 1, -1,  1}, { 1,  1,  1}, {-1,  1,  1}  // Front face
+    };
+    Vec3 colors[8] = {
+        {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0},
+        {255, 0, 255}, {0, 255, 255}, {255, 255, 255}, {128, 128, 128}
+    };
+    int indices[36] = {
+        0,1,2, 0,2,3, // Back
+        1,5,6, 1,6,2, // Right
+        5,4,7, 5,7,6, // Front
+        4,0,3, 4,3,7, // Left
+        3,2,6, 3,6,7, // Top
+        4,5,1, 4,1,0  // Bottom
+    };
 
-    // 3. Pass the rendered pixel array to Libretro
-    // Note: OpenGL renders bottom-to-top, but Libretro expects top-to-bottom.
-    // A quick hack is to pass the last row and a NEGATIVE pitch (stride).
-    uint32_t* top_row = frame_buf + (SCREEN_WIDTH * (SCREEN_HEIGHT - 1));
-    int pitch = -(SCREEN_WIDTH * sizeof(uint32_t));
+    // 3. Transformation & Projection
+    rotation_3d += 0.02f;
+    float sX = sinf(rotation_3d * 0.7f), cX = cosf(rotation_3d * 0.7f);
+    float sY = sinf(rotation_3d),        cY = cosf(rotation_3d);
+
+    SVertex projected[8];
+    for (int i = 0; i < 8; i++) {
+        // Rotate around Y axis
+        float x1 = verts[i].x * cY - verts[i].z * sY;
+        float z1 = verts[i].x * sY + verts[i].z * cY;
+        float y1 = verts[i].y;
+
+        // Rotate around X axis
+        float y2 = y1 * cX - z1 * sX;
+        float z2 = y1 * sX + z1 * cX;
+        float x2 = x1;
+
+        // Push into the screen so we can see it
+        z2 += 6.0f; 
+
+        // Perspective Projection
+        float fov = 1.2f; 
+        float xProj = (x2 / z2) * fov;
+        float yProj = (y2 / z2) * fov * ((float)SCREEN_WIDTH / SCREEN_HEIGHT);
+
+        // Map to 2D Screen Space
+        projected[i].x = (int)((xProj + 1.0f) * 0.5f * SCREEN_WIDTH);
+        projected[i].y = (int)((1.0f - yProj) * 0.5f * SCREEN_HEIGHT);
+        projected[i].z = z2; // Save 3D depth for Z-buffer
+        
+        projected[i].r = colors[i].x;
+        projected[i].g = colors[i].y;
+        projected[i].b = colors[i].z;
+    }
+
+    // 4. Rasterize all 12 triangles
+    for (int i = 0; i < 36; i += 3) {
+        draw_triangle_3d(
+            projected[indices[i]], 
+            projected[indices[i+1]], 
+            projected[indices[i+2]]
+        );
+    }
    
    // Push the completed software frame to the frontend.
    // Pitch = the width of the screen multiplied by the size of a single pixel (4 bytes for XRGB8888).
@@ -341,13 +450,6 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info)
    };
    environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
 	
-	if (!init_glContext(&the_Context, &frame_buf, SCREEN_WIDTH, SCREEN_HEIGHT)) {
-        return false;
-    }
-    
-    // 3. Set this context as the active one
-    set_glContext(&the_Context);
-	
    // 3. Load Content into Unicorn
    /*
    FILE *rom = fopen(retro_game_path, "rb");
@@ -377,7 +479,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info)
 }
 
 RETRO_API void retro_unload_game(void) {
-	free_glContext(&the_Context);
+
 }
 RETRO_API unsigned retro_get_region(void) { return RETRO_REGION_NTSC; }
 RETRO_API bool retro_load_game_special(unsigned, const struct retro_game_info*, size_t) { return false; }
