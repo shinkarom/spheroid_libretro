@@ -2,6 +2,15 @@
 #include <algorithm>
 #include <cfloat> 
 #include <cstring>
+#include <cmath> // Added for std::round
+#include <cstdio>
+
+// Helper for safe memory reading (fixes strict aliasing / unaligned access crashes)
+static inline uint32_t read_u32(const uint8_t* ram, uint32_t offset) {
+    uint32_t val;
+    std::memcpy(&val, &ram[offset], sizeof(uint32_t));
+    return val;
+}
 
 SpheroidGPU::SpheroidGPU() : color_buffer(nullptr), depth_buffer(nullptr), system_ram(nullptr) {}
 SpheroidGPU::~SpheroidGPU() { shutdown(); }
@@ -26,31 +35,35 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
     bool done = false;
 
     while (!done) {
-        uint32_t cmd = *(uint32_t*)&system_ram[ptr];
+        uint32_t cmd = read_u32(system_ram, ptr);
         ptr += 4;
 
         switch (cmd) {
             case 0x01: { // CLEAR
-                uint32_t color = *(uint32_t*)&system_ram[ptr];
+                uint32_t color = read_u32(system_ram, ptr);
                 ptr += 4;
                 for (uint32_t i = 0; i < width * height; i++) {
                     color_buffer[i] = color;
-                    // Because we store 1/W instead of Z, 0.0f means "infinitely far away"
+                    // Because we store 1/W instead of Z, -1.0f means "infinitely far away"
                     depth_buffer[i] = -1.0f; 
                 }
+				printf("clearing\n");
                 break;
             }
             case 0x02: { // SET_MATRIX
-                memcpy(&state.transform_matrix, &system_ram[ptr], sizeof(HMM_Mat4));
+                // memcpy is safe for unaligned blocks
+                std::memcpy(&state.transform_matrix, &system_ram[ptr], sizeof(HMM_Mat4));
                 ptr += 64; 
                 break;
             }
             case 0x03: { // BIND_TEXTURE
-                uint32_t tex_offset = *(uint32_t*)&system_ram[ptr];
-                state.tex_width  = *(uint32_t*)&system_ram[ptr + 4];
-                state.tex_height = *(uint32_t*)&system_ram[ptr + 8];
+                uint32_t tex_offset = read_u32(system_ram, ptr);
+                state.tex_width     = read_u32(system_ram, ptr + 4);
+                state.tex_height    = read_u32(system_ram, ptr + 8);
                 
                 if (tex_offset != 0) {
+                    // Safe to keep pointer if tex array is properly aligned by the allocator, 
+                    // otherwise texture reads in rasterize_triangle should use memcpy too.
                     state.texture_ptr = (uint32_t*)&system_ram[tex_offset];
                     state.texturing_enabled = true;
                 } else {
@@ -61,28 +74,31 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                 break;
             }
             case 0x04: { // DRAW_ARRAYS
-                uint32_t v_offset = *(uint32_t*)&system_ram[ptr];
-                uint32_t v_count  = *(uint32_t*)&system_ram[ptr + 4];
+                uint32_t v_offset = read_u32(system_ram, ptr);
+                uint32_t v_count  = read_u32(system_ram, ptr + 4);
                 ptr += 8;
-
-                GPUVertex* raw_verts = (GPUVertex*)&system_ram[v_offset];
                 
                 for (uint32_t i = 0; i < v_count; i += 3) {
                     ScreenVertex screen_verts[3];
                     bool reject = false;
 
                     for (int v = 0; v < 3; v++) {
-                        GPUVertex in = raw_verts[i + v];
+                        // Safely extract vertex without violating strict aliasing
+                        GPUVertex in;
+                        std::memcpy(&in, &system_ram[v_offset + (i + v) * sizeof(GPUVertex)], sizeof(GPUVertex));
+
                         HMM_Vec4 clip = state.transform_matrix * HMM_V4(in.x, in.y, in.z, 1.0f);
                         
+                        // Simple Near-Plane Rejection 
+                        // (TODO: Implement Sutherland-Hodgman Frustum Clipping here to prevent polygon popping)
                         if (clip.W < 0.1f) { reject = true; break; }
 
                         float inv_w = 1.0f / clip.W;
                         float ndc_x = clip.X * inv_w;
                         float ndc_y = clip.Y * inv_w;
 
-                        screen_verts[v].x = (ndc_x + 1.0f) * 0.5f * width;
-                        screen_verts[v].y = (1.0f - ndc_y) * 0.5f * height;
+                        screen_verts[v].x = (ndc_x + 1.0f) * 0.5f * (float)width;
+                        screen_verts[v].y = (1.0f - ndc_y) * 0.5f * (float)height;
                         screen_verts[v].z = clip.Z * inv_w; 
                         screen_verts[v].inv_w = inv_w;
                         
@@ -111,7 +127,6 @@ void SpheroidGPU::rasterize_triangle(const ScreenVertex& v0, const ScreenVertex&
     const int SUB_BITS = 4;
     const float SUB_MULT = 16.0f; 
 
-    // Use std::round to prevent vertex snapping across the 0-axis, and cast to 64-bit
     int64_t x0 = (int64_t)std::round(v0.x * SUB_MULT), y0 = (int64_t)std::round(v0.y * SUB_MULT);
     int64_t x1 = (int64_t)std::round(v1.x * SUB_MULT), y1 = (int64_t)std::round(v1.y * SUB_MULT);
     int64_t x2 = (int64_t)std::round(v2.x * SUB_MULT), y2 = (int64_t)std::round(v2.y * SUB_MULT);
@@ -121,15 +136,18 @@ void SpheroidGPU::rasterize_triangle(const ScreenVertex& v0, const ScreenVertex&
     if (state.backface_culling && area <= 0) return;
     if (area == 0) return;
 
-    int64_t A0 = y2 - y1, B0 = x1 - x2;
-    int64_t A1 = y0 - y2, B1 = x2 - x0;
-    int64_t A2 = y1 - y0, B2 = x0 - x1;
-
-    // Convert back to 32-bit for screen looping
+    // Bounding Box
     int minX = std::max(0LL, std::min({x0, x1, x2}) >> SUB_BITS);
     int minY = std::max(0LL, std::min({y0, y1, y2}) >> SUB_BITS);
     int maxX = std::min((int64_t)width - 1,  (std::max({x0, x1, x2}) + 15) >> SUB_BITS);
     int maxY = std::min((int64_t)height - 1, (std::max({y0, y1, y2}) + 15) >> SUB_BITS);
+
+    // Bounding Box Early-Out (Optimization)
+    if (minX >= (int)width || maxX < 0 || minY >= (int)height || maxY < 0) return;
+
+    int64_t A0 = y2 - y1, B0 = x1 - x2;
+    int64_t A1 = y0 - y2, B1 = x2 - x0;
+    int64_t A2 = y1 - y0, B2 = x0 - x1;
 
     int64_t px = (minX << SUB_BITS) + 8;
     int64_t py = (minY << SUB_BITS) + 8;
@@ -149,8 +167,29 @@ void SpheroidGPU::rasterize_triangle(const ScreenVertex& v0, const ScreenVertex&
         row_w2 = -row_w2; stepX_w2 = -stepX_w2; stepY_w2 = -stepY_w2;
     }
 
-    // USE DOUBLE PRECISION (53-bit mantissa) to prevent texture warping!
+    // Top-Left Rule bias to prevent overdraw on shared edges
+    auto edge_bias = [](int64_t dy, int64_t dx) -> int64_t {
+        return ((dx > 0) || (dx == 0 && dy < 0)) ? 0 : -1;
+    };
+    row_w0 += edge_bias(A0, B0);
+    row_w1 += edge_bias(A1, B1);
+    row_w2 += edge_bias(A2, B2);
+
+    // Precalculate Barycentric Steps outside the loop (Massive optimization)
+    // Kept as double precision to prevent texture warping on huge screens
     double inv_area = 1.0 / (double)area;
+    
+    double inv_w0_step = inv_area * v0.inv_w;
+    double inv_w1_step = inv_area * v1.inv_w;
+    double inv_w2_step = inv_area * v2.inv_w;
+
+    double u0_step = inv_area * v0.u, v0_step = inv_area * v0.v;
+    double u1_step = inv_area * v1.u, v1_step = inv_area * v1.v;
+    double u2_step = inv_area * v2.u, v2_step = inv_area * v2.v;
+
+    double r0_step = inv_area * v0.r, g0_step = inv_area * v0.g, b0_step = inv_area * v0.b;
+    double r1_step = inv_area * v1.r, g1_step = inv_area * v1.g, b1_step = inv_area * v1.b;
+    double r2_step = inv_area * v2.r, g2_step = inv_area * v2.g, b2_step = inv_area * v2.b;
 
     for (int y = minY; y <= maxY; y++) {
         int64_t w0 = row_w0, w1 = row_w1, w2 = row_w2;
@@ -159,31 +198,25 @@ void SpheroidGPU::rasterize_triangle(const ScreenVertex& v0, const ScreenVertex&
         for (int x = minX; x <= maxX; x++) {
             if ((w0 | w1 | w2) >= 0) {
                 
-                // Convert to float cleanly via double
-                float fw0 = (float)((double)w0 * inv_area);
-                float fw1 = (float)((double)w1 * inv_area);
-                float fw2 = (float)((double)w2 * inv_area);
-
-                float interp_inv_w = fw0 * v0.inv_w + fw1 * v1.inv_w + fw2 * v2.inv_w;
+                // Fast float evaluation from precalculated double steps
+                float interp_inv_w = (float)(w0 * inv_w0_step + w1 * inv_w1_step + w2 * inv_w2_step);
 
                 if (!state.depth_test_enabled || interp_inv_w > depth_buffer[pixel_idx]) {
                     depth_buffer[pixel_idx] = interp_inv_w;
 
                     float w = 1.0f / interp_inv_w;
 
-                    float u = (fw0 * v0.u + fw1 * v1.u + fw2 * v2.u) * w;
-                    float v = (fw0 * v0.v + fw1 * v1.v + fw2 * v2.v) * w;
+                    float u = (float)(w0 * u0_step + w1 * u1_step + w2 * u2_step) * w;
+                    float v = (float)(w0 * v0_step + w1 * v1_step + w2 * v2_step) * w;
 
-                    int r = (int)((fw0 * v0.r + fw1 * v1.r + fw2 * v2.r) * w);
-                    int g = (int)((fw0 * v0.g + fw1 * v1.g + fw2 * v2.g) * w);
-                    int b = (int)((fw0 * v0.b + fw1 * v1.b + fw2 * v2.b) * w);
+                    int r = (int)((float)(w0 * r0_step + w1 * r1_step + w2 * r2_step) * w);
+                    int g = (int)((float)(w0 * g0_step + w1 * g1_step + w2 * g2_step) * w);
+                    int b = (int)((float)(w0 * b0_step + w1 * b1_step + w2 * b2_step) * w);
 
                     if (state.texturing_enabled) {
-                        int tx = (int)(u * state.tex_width) % state.tex_width;
-                        int ty = (int)(v * state.tex_height) % state.tex_height;
-                        
-                        if (tx < 0) tx += state.tex_width;
-                        if (ty < 0) ty += state.tex_height;
+                        // Fast Bitwise wrapping (ASSUMES textures are a Power of Two, e.g., 64, 128, 256)
+                        int tx = (int)(u * state.tex_width) & (state.tex_width - 1);
+                        int ty = (int)(v * state.tex_height) & (state.tex_height - 1);
 
                         uint32_t texel = state.texture_ptr[ty * state.tex_width + tx];
                         

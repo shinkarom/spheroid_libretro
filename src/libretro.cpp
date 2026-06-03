@@ -13,10 +13,12 @@
 #include <cstring>
 #define _USE_MATH_DEFINES
 #include <math.h>
-#include <elf.h>
+#include "elf.h"
 #include <gpu.hpp>
 #include <HandmadeMath.h>
 #include <vector>
+#include <string>
+#include <cstdarg>
 
 #if defined(_WIN32) && !defined(_XBOX)
 #include <windows.h>
@@ -108,90 +110,15 @@ constexpr uint32_t VRAM_LIST_OFFSET   = 0x01000000;
 constexpr uint32_t VRAM_VERTEX_OFFSET = 0x02000000; 
 constexpr uint32_t VRAM_TEXTURE_OFFSET = 0x03000000;
 
-// Change this number to stress the CPU! 
-// 512 cubes = 18,432 triangles per frame.
-constexpr int GRID_SIZE = 2; 
-constexpr int TOTAL_CUBES = GRID_SIZE * GRID_SIZE * GRID_SIZE; 
-
-static void simulate_guest_game() {
-    rotation_3d += 0.02f; 
-    float rot = rotation_3d;
-    
-    static bool uploaded = false;
-    if (!uploaded) {
-        // 1. Generate a 64x64 Checkerboard Texture
-        uint32_t* tex_ram = (uint32_t*)&console_ram[VRAM_TEXTURE_OFFSET];
-        for (int y = 0; y < 64; y++) {
-            for (int x = 0; x < 64; x++) {
-                bool is_white = ((x / 8) % 2) == ((y / 8) % 2);
-                tex_ram[y * 64 + x] = is_white ? 0xFFFFFFFF : 0xFF444444; // White/Dark Gray
-            }
-        }
-
-        // 2. Upload Mesh with UVs
-        // A single 8-vertex cube shares vertices, so UVs wrap weirdly, 
-        // but it's enough to prove the texture mapper works!
-        GPUVertex* vram_verts = (GPUVertex*)&console_ram[VRAM_VERTEX_OFFSET];
-        int v_count = 0;
-        
-        // Quick & Dirty Procedural UV mapping for the demo
-        HMM_Vec2 fake_uvs[3] = { {0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f} };
-
-        for (size_t j = 0; j < demo_cube.indices.size(); j++) {
-            int idx = demo_cube.indices[j];
-            vram_verts[v_count++] = {
-                demo_cube.vertices[idx].X, demo_cube.vertices[idx].Y, demo_cube.vertices[idx].Z,
-                fake_uvs[j % 3].X, fake_uvs[j % 3].Y, // UVs
-                (uint8_t)demo_cube.colors[idx].X, (uint8_t)demo_cube.colors[idx].Y, (uint8_t)demo_cube.colors[idx].Z, 255
-            };
-        }
-        uploaded = true;
+static void file_log(const char* fmt, ...) {
+    FILE* f = fopen("spheroid_debug.txt", "a");
+    if (f) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        va_end(args);
+        fclose(f);
     }
-
-    uint32_t* cmd_list = (uint32_t*)&console_ram[VRAM_LIST_OFFSET];
-    uint32_t c = 0; 
-    
-    cmd_list[c++] = 0x01; // CLEAR
-    cmd_list[c++] = 0xFF101020; 
-
-    // NEW: Bind the texture!
-    cmd_list[c++] = 0x03; // BIND_TEXTURE
-    cmd_list[c++] = VRAM_TEXTURE_OFFSET;
-    cmd_list[c++] = 64;   // Width
-    cmd_list[c++] = 64;   // Height
-
-    HMM_Mat4 proj = HMM_Perspective_LH_ZO(1.2f, ASPECT_RATIO, 0.1f, 100.0f);
-    HMM_Mat4 rotX = HMM_Rotate_LH(rot * 0.2f, HMM_V3(1.0f, 0.0f, 0.0f));
-    HMM_Mat4 rotY = HMM_Rotate_LH(rot * 0.3f, HMM_V3(0.0f, 1.0f, 0.0f));
-    HMM_Mat4 view = HMM_Translate(HMM_V3(0.0f, 0.0f, 20.0f)) * (rotY * rotX);
-    HMM_Mat4 view_proj = proj * view;
-
-    for (int i = 0; i < TOTAL_CUBES; i++) {
-        float x = (i % GRID_SIZE) - (GRID_SIZE / 2.0f);
-        float y = ((i / GRID_SIZE) % GRID_SIZE) - (GRID_SIZE / 2.0f);
-        float z = ((i / (GRID_SIZE * GRID_SIZE)) % GRID_SIZE) - (GRID_SIZE / 2.0f);
-
-        float local_rot = rot * 2.0f + (x * 0.5f);
-
-        HMM_Mat4 m_trans = HMM_Translate(HMM_V3(x * 2.5f, y * 2.5f, z * 2.5f));
-        HMM_Mat4 m_rotX  = HMM_Rotate_LH(local_rot, HMM_V3(1.0f, 0.0f, 0.0f));
-        HMM_Mat4 m_rotY  = HMM_Rotate_LH(local_rot, HMM_V3(0.0f, 1.0f, 0.0f));
-        HMM_Mat4 m_scale = HMM_Scale(HMM_V3(0.4f, 0.4f, 0.4f));
-        
-        HMM_Mat4 mvp = view_proj * m_trans * (m_rotY * m_rotX) * m_scale;
-
-        cmd_list[c++] = 0x02; // SET_MATRIX
-        memcpy(&cmd_list[c], &mvp, sizeof(HMM_Mat4));
-        c += 16; 
-
-        cmd_list[c++] = 0x04; // DRAW_ARRAYS
-        cmd_list[c++] = VRAM_VERTEX_OFFSET;
-        cmd_list[c++] = 36; 
-    }
-    
-    cmd_list[c++] = 0xFF; // END LIST
-
-    gpu.execute_display_list(VRAM_LIST_OFFSET);
 }
 // =============================================================================
 // Libretro Callbacks
@@ -428,16 +355,11 @@ RETRO_API void retro_run(void)
     uc_err err = uc_emu_start(uc, current_pc, 0xFFFFFFFFFFFFFFFF , 0, cpuIpf);
 
     if (err) {
-        // Write error to a file
-        FILE* f = fopen("unicorn_debug.txt", "w");
-        if (f) {
-            fprintf(f, "CPU Crash: %s\n", uc_strerror(err));
-            fclose(f);
-        }
+		file_log("[CPU CRASH] Err: %u (%s) at PC: 0x%lX\n", err, uc_strerror(err), current_pc);
     }
 
-   simulate_guest_game();
-   
+   gpu.execute_display_list(VRAM_LIST_OFFSET);
+
    // Push the completed software frame to the frontend.
    // Pitch = the width of the screen multiplied by the size of a single pixel (4 bytes for XRGB8888).
    video_cb(gpu.get_framebuffer(), SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(uint32_t));
@@ -454,8 +376,38 @@ RETRO_API void retro_run(void)
    }
 }
 
+static std::string guest_debug_buffer;
+
+// Unicorn callback for when the guest writes to our MMIO region
+static void mmio_write_cb(uc_engine *uc, uc_mem_type type, uint64_t address, int size, int64_t value, void *user_data) {
+    if (address == 0x20000000) {
+        // Print the exact character the Zig game sent us
+        file_log("%c", (char)(value & 0xFF));
+    }
+}
+
+// Hook to catch the 'SVC' (Syscall) instruction from the guest
+static void intr_hook_cb(uc_engine *uc, uint32_t intno, void *user_data) {
+    // intno 2 is UC_ARM64_EXCP_SVC
+    if (intno == 2) {
+        uint64_t pc;
+        uc_reg_read(uc, UC_ARM64_REG_PC, &pc);
+        
+        // IMPORTANT: We must manually advance the PC by 4 bytes (the size of an ARM64 instruction).
+        // Otherwise, when the next frame starts, Unicorn will execute the exact same SVC instruction again and freeze.
+        pc += 4;
+        uc_reg_write(uc, UC_ARM64_REG_PC, &pc);
+        
+        // Immediately pause the CPU. Control returns to retro_run()!
+        uc_emu_stop(uc);
+    }
+}
+
 RETRO_API bool retro_load_game(const struct retro_game_info *info)
 {
+	remove("spheroid_debug.txt");
+   file_log("--- NEW SESSION BOOT ---\n");
+   file_log("Loading ELF: %s\n", retro_game_path);
    // Strict constraint: Must have a valid ROM path!
    if (!info || !info->path) {
       if (log_cb) log_cb(RETRO_LOG_ERROR, "Spheroid requires a valid ROM path to boot.\n");
@@ -497,42 +449,94 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info)
    };
    environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
 	
-   // 3. Load Content into Unicorn
-   /*
+	// 1. Map 4KB of memory at 0x20000000 for Hardware Registers (MMIO)
+   constexpr uint64_t MMIO_BASE = 0x20000000;
+   uc_mem_map(uc, MMIO_BASE, 4096, UC_PROT_READ | UC_PROT_WRITE);
+
+   // 2. Attach the write hook to this region
+   uc_hook trace_hook;
+   uc_hook_add(uc, &trace_hook, UC_HOOK_MEM_WRITE, (void*)mmio_write_cb, nullptr, MMIO_BASE, MMIO_BASE + 4095);
+   uc_hook intr_hook;
+   uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void*)intr_hook_cb, nullptr, 1, 0);
+	
+   // 3. Open and Parse the ELF Executable
    FILE *rom = fopen(retro_game_path, "rb");
-   if (rom) {
-       fseek(rom, 0, SEEK_END);
-       size_t rom_size = ftell(rom);
-       fseek(rom, 0, SEEK_SET);
-       uint8_t *rom_data = new uint8_t[rom_size];
-       fread(rom_data, 1, rom_size, rom);
-       fclose(rom);
-
-       // Map memory and write ROM
-       uc_mem_map(uc, 0x10000, 2 * 1024 * 1024, UC_PROT_ALL);
-       uc_mem_write(uc, 0x10000, rom_data, rom_size);
-       delete[] rom_data;
+   if (!rom) {
+      if (log_cb) log_cb(RETRO_LOG_ERROR, "Failed to open ELF file: %s\n", retro_game_path);
+      return false;
    }
-   */
 
-	// 1. Put some dummy ARM64 machine code into our RAM (at the beginning).
-    // In a real scenario, you would use fread() to load a game's ".bin" file into console_ram here.
-    
-    // This is ARM64 machine code for: 
-    // mov w0, #0x1234
-    // b .-4  
-    uint32_t boot_code[] = { 0x52a24680, 0x17ffffff   }; 
-    memcpy(&console_ram[0], boot_code, sizeof(boot_code));
+   fseek(rom, 0, SEEK_END);
+   size_t rom_size = ftell(rom);
+   fseek(rom, 0, SEEK_SET);
 
-    // 2. Set the Stack Pointer (SP) to the very top of our 128MB RAM.
-    uint64_t sp_value = RAM_BASE_ADDRESS + RAM_SIZE;
-    uc_reg_write(uc, UC_ARM64_REG_SP, &sp_value);
+   std::vector<uint8_t> elf_data(rom_size);
+   fread(elf_data.data(), 1, rom_size, rom);
+   fclose(rom);
 
-    // 3. Set the Program Counter (PC) to the start of our RAM (where our boot code is).
-    uint64_t pc_value = RAM_BASE_ADDRESS;
-    uc_reg_write(uc, UC_ARM64_REG_PC, &pc_value);
+   if (rom_size < sizeof(Elf64_Ehdr)) {
+       if (log_cb) log_cb(RETRO_LOG_ERROR, "File too small to be a valid ELF.\n");
+       return false;
+   }
 
-   // 4. Connect Keyboard Hook
+   Elf64_Ehdr* ehdr = (Elf64_Ehdr*)elf_data.data();
+
+   // Verify ELF Magic Numbers (\x7F E L F)
+   if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
+       if (log_cb) log_cb(RETRO_LOG_ERROR, "Invalid ELF magic number.\n");
+       return false;
+   }
+
+   // Verify it's a 64-bit ARM64 Executable
+   if (ehdr->e_ident[EI_CLASS] != ELFCLASS64 || ehdr->e_machine != EM_AARCH64) {
+       if (log_cb) log_cb(RETRO_LOG_ERROR, "Game is not an ARM64 (AArch64) executable.\n");
+       return false;
+   }
+
+   // Iterate through Program Headers to find loadable segments
+   Elf64_Phdr* phdr = (Elf64_Phdr*)(elf_data.data() + ehdr->e_phoff);
+   
+   for (int i = 0; i < ehdr->e_phnum; i++) {
+       // PT_LOAD means this segment needs to be loaded into system RAM
+       if (phdr[i].p_type == PT_LOAD && phdr[i].p_memsz > 0) {
+           uint64_t vaddr = phdr[i].p_vaddr;
+           uint64_t memsz = phdr[i].p_memsz;
+           uint64_t filesz = phdr[i].p_filesz;
+           uint64_t offset = phdr[i].p_offset;
+
+           // Ensure the segment fits inside our configured RAM space (128MB at 0x10000000)
+           if (vaddr >= RAM_BASE_ADDRESS && (vaddr + memsz) <= (RAM_BASE_ADDRESS + RAM_SIZE)) {
+               uint32_t ram_offset = (uint32_t)(vaddr - RAM_BASE_ADDRESS);
+               
+               // Copy the code/data from the file into RAM
+               if (filesz > 0) {
+                   memcpy(&console_ram[ram_offset], elf_data.data() + offset, filesz);
+               }
+               
+               // Zero out remaining memory (This handles the .bss section for uninitialized variables)
+               if (memsz > filesz) {
+                   memset(&console_ram[ram_offset + filesz], 0, memsz - filesz);
+               }
+               
+               if (log_cb) log_cb(RETRO_LOG_INFO, "Loaded ELF Segment: Addr 0x%lX, Size: %lu bytes\n", vaddr, memsz);
+           } else {
+               if (log_cb) log_cb(RETRO_LOG_WARN, "ELF Segment out of bounds (Addr 0x%lX). Ignored.\n", vaddr);
+           }
+       }
+   }
+
+   // 4. Set the Stack Pointer (SP) to the very top of our 128MB RAM.
+   // ARM64 stacks grow downwards.
+   uint64_t sp_value = RAM_BASE_ADDRESS + RAM_SIZE;
+   uc_reg_write(uc, UC_ARM64_REG_SP, &sp_value);
+
+   // 5. Set the Program Counter (PC) to the ELF Entry Point.
+   uint64_t pc_value = ehdr->e_entry;
+   uc_reg_write(uc, UC_ARM64_REG_PC, &pc_value);
+
+   if (log_cb) log_cb(RETRO_LOG_INFO, "Game loaded successfully! Entry Point: 0x%lX\n", pc_value);
+
+   // 6. Connect Keyboard Hook
    struct retro_keyboard_callback kb_cb = { keyboard_cb };
    environ_cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK, &kb_cb);
 
