@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 #include <algorithm>
 #include <cfloat> 
+#include <cstring>
 
 SpheroidGPU::SpheroidGPU() : color_buffer(nullptr), depth_buffer(nullptr), system_ram(nullptr) {}
 SpheroidGPU::~SpheroidGPU() { shutdown(); }
@@ -34,8 +35,29 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                 ptr += 4;
                 for (uint32_t i = 0; i < width * height; i++) {
                     color_buffer[i] = color;
-                    depth_buffer[i] = FLT_MAX;
+                    // Because we store 1/W instead of Z, 0.0f means "infinitely far away"
+                    depth_buffer[i] = -1.0f; 
                 }
+                break;
+            }
+            case 0x02: { // SET_MATRIX
+                memcpy(&state.transform_matrix, &system_ram[ptr], sizeof(HMM_Mat4));
+                ptr += 64; 
+                break;
+            }
+            case 0x03: { // BIND_TEXTURE
+                uint32_t tex_offset = *(uint32_t*)&system_ram[ptr];
+                state.tex_width  = *(uint32_t*)&system_ram[ptr + 4];
+                state.tex_height = *(uint32_t*)&system_ram[ptr + 8];
+                
+                if (tex_offset != 0) {
+                    state.texture_ptr = (uint32_t*)&system_ram[tex_offset];
+                    state.texturing_enabled = true;
+                } else {
+                    state.texture_ptr = nullptr;
+                    state.texturing_enabled = false;
+                }
+                ptr += 12;
                 break;
             }
             case 0x04: { // DRAW_ARRAYS
@@ -43,9 +65,36 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                 uint32_t v_count  = *(uint32_t*)&system_ram[ptr + 4];
                 ptr += 8;
 
-                GPUVertex* verts = (GPUVertex*)&system_ram[v_offset];
+                GPUVertex* raw_verts = (GPUVertex*)&system_ram[v_offset];
+                
                 for (uint32_t i = 0; i < v_count; i += 3) {
-                    rasterize_triangle(verts[i], verts[i+1], verts[i+2]);
+                    ScreenVertex screen_verts[3];
+                    bool reject = false;
+
+                    for (int v = 0; v < 3; v++) {
+                        GPUVertex in = raw_verts[i + v];
+                        HMM_Vec4 clip = state.transform_matrix * HMM_V4(in.x, in.y, in.z, 1.0f);
+                        
+                        if (clip.W < 0.1f) { reject = true; break; }
+
+                        float inv_w = 1.0f / clip.W;
+                        float ndc_x = clip.X * inv_w;
+                        float ndc_y = clip.Y * inv_w;
+
+                        screen_verts[v].x = (ndc_x + 1.0f) * 0.5f * width;
+                        screen_verts[v].y = (1.0f - ndc_y) * 0.5f * height;
+                        screen_verts[v].z = clip.Z * inv_w; 
+                        screen_verts[v].inv_w = inv_w;
+                        
+                        // Pre-multiply Colors and UVs by 1/W
+                        screen_verts[v].r = (float)in.r * inv_w;
+                        screen_verts[v].g = (float)in.g * inv_w; 
+                        screen_verts[v].b = (float)in.b * inv_w; 
+                        screen_verts[v].u = in.u * inv_w; 
+                        screen_verts[v].v = in.v * inv_w; 
+                    }
+
+                    if (!reject) rasterize_triangle(screen_verts[0], screen_verts[1], screen_verts[2]);
                 }
                 break;
             }
@@ -58,55 +107,105 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
     }
 }
 
-void SpheroidGPU::rasterize_triangle(const GPUVertex& v0, const GPUVertex& v1, const GPUVertex& v2) {
-    int x0 = (int)v0.x, y0 = (int)v0.y;
-    int x1 = (int)v1.x, y1 = (int)v1.y;
-    int x2 = (int)v2.x, y2 = (int)v2.y;
+void SpheroidGPU::rasterize_triangle(const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2) {
+    const int SUB_BITS = 4;
+    const float SUB_MULT = 16.0f; 
 
-    int area = (x2 - x0) * (y1 - y0) - (y2 - y0) * (x1 - x0);
-    
+    // Use std::round to prevent vertex snapping across the 0-axis, and cast to 64-bit
+    int64_t x0 = (int64_t)std::round(v0.x * SUB_MULT), y0 = (int64_t)std::round(v0.y * SUB_MULT);
+    int64_t x1 = (int64_t)std::round(v1.x * SUB_MULT), y1 = (int64_t)std::round(v1.y * SUB_MULT);
+    int64_t x2 = (int64_t)std::round(v2.x * SUB_MULT), y2 = (int64_t)std::round(v2.y * SUB_MULT);
+
+    // 64-bit Area (Prevents overflow tearing)
+    int64_t area = (x2 - x0) * (y1 - y0) - (y2 - y0) * (x1 - x0);
     if (state.backface_culling && area <= 0) return;
     if (area == 0) return;
 
-    int A0 = (y2 - y1), B0 = (x1 - x2);
-    int A1 = (y0 - y2), B1 = (x2 - x0);
-    int A2 = (y1 - y0), B2 = (x0 - x1);
+    int64_t A0 = y2 - y1, B0 = x1 - x2;
+    int64_t A1 = y0 - y2, B1 = x2 - x0;
+    int64_t A2 = y1 - y0, B2 = x0 - x1;
 
-    int minX = std::max(0, std::min({x0, x1, x2}));
-    int minY = std::max(0, std::min({y0, y1, y2}));
-    int maxX = std::min((int)width - 1,  std::max({x0, x1, x2}));
-    int maxY = std::min((int)height - 1, std::max({y0, y1, y2}));
+    // Convert back to 32-bit for screen looping
+    int minX = std::max(0LL, std::min({x0, x1, x2}) >> SUB_BITS);
+    int minY = std::max(0LL, std::min({y0, y1, y2}) >> SUB_BITS);
+    int maxX = std::min((int64_t)width - 1,  (std::max({x0, x1, x2}) + 15) >> SUB_BITS);
+    int maxY = std::min((int64_t)height - 1, (std::max({y0, y1, y2}) + 15) >> SUB_BITS);
 
-    int row_w0 = (minX - x1) * A0 + (minY - y1) * B0;
-    int row_w1 = (minX - x2) * A1 + (minY - y2) * B1;
-    int row_w2 = (minX - x0) * A2 + (minY - y0) * B2;
+    int64_t px = (minX << SUB_BITS) + 8;
+    int64_t py = (minY << SUB_BITS) + 8;
+
+    int64_t row_w0 = (px - x1) * A0 + (py - y1) * B0;
+    int64_t row_w1 = (px - x2) * A1 + (py - y2) * B1;
+    int64_t row_w2 = (px - x0) * A2 + (py - y0) * B2;
+
+    int64_t stepX_w0 = A0 * 16, stepY_w0 = B0 * 16;
+    int64_t stepX_w1 = A1 * 16, stepY_w1 = B1 * 16;
+    int64_t stepX_w2 = A2 * 16, stepY_w2 = B2 * 16;
 
     if (area < 0) {
         area = -area;
-        row_w0 = -row_w0; A0 = -A0; B0 = -B0;
-        row_w1 = -row_w1; A1 = -A1; B1 = -B1;
-        row_w2 = -row_w2; A2 = -A2; B2 = -B2;
+        row_w0 = -row_w0; stepX_w0 = -stepX_w0; stepY_w0 = -stepY_w0;
+        row_w1 = -row_w1; stepX_w1 = -stepX_w1; stepY_w1 = -stepY_w1;
+        row_w2 = -row_w2; stepX_w2 = -stepX_w2; stepY_w2 = -stepY_w2;
     }
 
+    // USE DOUBLE PRECISION (53-bit mantissa) to prevent texture warping!
+    double inv_area = 1.0 / (double)area;
+
     for (int y = minY; y <= maxY; y++) {
-        int w0 = row_w0, w1 = row_w1, w2 = row_w2;
+        int64_t w0 = row_w0, w1 = row_w1, w2 = row_w2;
         int pixel_idx = y * width + minX;
 
         for (int x = minX; x <= maxX; x++) {
             if ((w0 | w1 | w2) >= 0) {
-                float z = (w0 * v0.z + w1 * v1.z + w2 * v2.z) / area;
                 
-                if (!state.depth_test_enabled || z < depth_buffer[pixel_idx]) {
-                    depth_buffer[pixel_idx] = z;
-                    int r = (w0 * v0.r + w1 * v1.r + w2 * v2.r) / area;
-                    int g = (w0 * v0.g + w1 * v1.g + w2 * v2.g) / area;
-                    int b = (w0 * v0.b + w1 * v1.b + w2 * v2.b) / area;
+                // Convert to float cleanly via double
+                float fw0 = (float)((double)w0 * inv_area);
+                float fw1 = (float)((double)w1 * inv_area);
+                float fw2 = (float)((double)w2 * inv_area);
+
+                float interp_inv_w = fw0 * v0.inv_w + fw1 * v1.inv_w + fw2 * v2.inv_w;
+
+                if (!state.depth_test_enabled || interp_inv_w > depth_buffer[pixel_idx]) {
+                    depth_buffer[pixel_idx] = interp_inv_w;
+
+                    float w = 1.0f / interp_inv_w;
+
+                    float u = (fw0 * v0.u + fw1 * v1.u + fw2 * v2.u) * w;
+                    float v = (fw0 * v0.v + fw1 * v1.v + fw2 * v2.v) * w;
+
+                    int r = (int)((fw0 * v0.r + fw1 * v1.r + fw2 * v2.r) * w);
+                    int g = (int)((fw0 * v0.g + fw1 * v1.g + fw2 * v2.g) * w);
+                    int b = (int)((fw0 * v0.b + fw1 * v1.b + fw2 * v2.b) * w);
+
+                    if (state.texturing_enabled) {
+                        int tx = (int)(u * state.tex_width) % state.tex_width;
+                        int ty = (int)(v * state.tex_height) % state.tex_height;
+                        
+                        if (tx < 0) tx += state.tex_width;
+                        if (ty < 0) ty += state.tex_height;
+
+                        uint32_t texel = state.texture_ptr[ty * state.tex_width + tx];
+                        
+                        int tr = (texel >> 16) & 0xFF;
+                        int tg = (texel >> 8) & 0xFF;
+                        int tb = texel & 0xFF;
+
+                        r = (r * tr) / 255;
+                        g = (g * tg) / 255;
+                        b = (b * tb) / 255;
+                    }
+
+                    r = std::clamp(r, 0, 255);
+                    g = std::clamp(g, 0, 255);
+                    b = std::clamp(b, 0, 255);
+
                     color_buffer[pixel_idx] = (255 << 24) | (r << 16) | (g << 8) | b;
                 }
             }
-            w0 += A0; w1 += A1; w2 += A2;
+            w0 += stepX_w0; w1 += stepX_w1; w2 += stepX_w2;
             pixel_idx++;
         }
-        row_w0 += B0; row_w1 += B1; row_w2 += B2;
+        row_w0 += stepY_w0; row_w1 += stepY_w1; row_w2 += stepY_w2;
     }
 }

@@ -15,7 +15,8 @@
 #include <math.h>
 #include <elf.h>
 #include <gpu.hpp>
-#include <math3d.hpp>
+#include <HandmadeMath.h>
+#include <vector>
 
 #if defined(_WIN32) && !defined(_XBOX)
 #include <windows.h>
@@ -40,6 +41,7 @@ constexpr float ASPECT_RATIO = 4.f / 3.0f;
 constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
 constexpr unsigned FPS = 60;
 constexpr unsigned SAMPLES_PER_FRAME = AUDIO_SAMPLE_RATE / FPS; // 735 samples
+constexpr auto cpuMips = 50;
 
 // Unicorn requires memory sizes and addresses to be multiples of 4KB (4096 bytes).
 // 128 MB is perfectly aligned (134,217,728 bytes).
@@ -78,6 +80,12 @@ static CoreState core_state = {0, 0.0};
 
 static SpheroidGPU gpu;
 
+struct Mesh {
+    std::vector<HMM_Vec3> vertices;
+    std::vector<HMM_Vec3> colors; // Using Vec3 for RGB 0-255 is fine here
+    std::vector<int> indices;
+};
+
 static float rotation_3d = 0.0f;
 static Mesh demo_cube = []() {
     Mesh m;
@@ -98,78 +106,93 @@ static Mesh demo_cube = []() {
 
 constexpr uint32_t VRAM_LIST_OFFSET   = 0x01000000; 
 constexpr uint32_t VRAM_VERTEX_OFFSET = 0x02000000; 
+constexpr uint32_t VRAM_TEXTURE_OFFSET = 0x03000000;
 
 // Change this number to stress the CPU! 
 // 512 cubes = 18,432 triangles per frame.
-constexpr int GRID_SIZE = 10; 
+constexpr int GRID_SIZE = 2; 
 constexpr int TOTAL_CUBES = GRID_SIZE * GRID_SIZE * GRID_SIZE; 
 
 static void simulate_guest_game() {
-    rotation_3d += 0.02f;
+    rotation_3d += 0.02f; 
+    float rot = rotation_3d;
     
-    GPUVertex* vram_verts = (GPUVertex*)&console_ram[VRAM_VERTEX_OFFSET];
-    uint32_t vertex_count = 0;
-    float fov = 1.2f;
+    static bool uploaded = false;
+    if (!uploaded) {
+        // 1. Generate a 64x64 Checkerboard Texture
+        uint32_t* tex_ram = (uint32_t*)&console_ram[VRAM_TEXTURE_OFFSET];
+        for (int y = 0; y < 64; y++) {
+            for (int x = 0; x < 64; x++) {
+                bool is_white = ((x / 8) % 2) == ((y / 8) % 2);
+                tex_ram[y * 64 + x] = is_white ? 0xFFFFFFFF : 0xFF444444; // White/Dark Gray
+            }
+        }
 
-    // A camera matrix that pushes the whole cloud 20 units into the screen
-    // and slowly rotates the entire field.
-    Mat4 camera_mat = mat4_translation(0.0f, 0.0f, 20.0f) * 
-                      mat4_rotation(rotation_3d * 0.2f, rotation_3d * 0.3f, 0.0f);
-
-    // 1. Generate the Asteroid Field
-    for (int i = 0; i < TOTAL_CUBES; i++) {
+        // 2. Upload Mesh with UVs
+        // A single 8-vertex cube shares vertices, so UVs wrap weirdly, 
+        // but it's enough to prove the texture mapper works!
+        GPUVertex* vram_verts = (GPUVertex*)&console_ram[VRAM_VERTEX_OFFSET];
+        int v_count = 0;
         
-        // Calculate grid position (from -half to +half)
+        // Quick & Dirty Procedural UV mapping for the demo
+        HMM_Vec2 fake_uvs[3] = { {0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f} };
+
+        for (size_t j = 0; j < demo_cube.indices.size(); j++) {
+            int idx = demo_cube.indices[j];
+            vram_verts[v_count++] = {
+                demo_cube.vertices[idx].X, demo_cube.vertices[idx].Y, demo_cube.vertices[idx].Z,
+                fake_uvs[j % 3].X, fake_uvs[j % 3].Y, // UVs
+                (uint8_t)demo_cube.colors[idx].X, (uint8_t)demo_cube.colors[idx].Y, (uint8_t)demo_cube.colors[idx].Z, 255
+            };
+        }
+        uploaded = true;
+    }
+
+    uint32_t* cmd_list = (uint32_t*)&console_ram[VRAM_LIST_OFFSET];
+    uint32_t c = 0; 
+    
+    cmd_list[c++] = 0x01; // CLEAR
+    cmd_list[c++] = 0xFF101020; 
+
+    // NEW: Bind the texture!
+    cmd_list[c++] = 0x03; // BIND_TEXTURE
+    cmd_list[c++] = VRAM_TEXTURE_OFFSET;
+    cmd_list[c++] = 64;   // Width
+    cmd_list[c++] = 64;   // Height
+
+    HMM_Mat4 proj = HMM_Perspective_LH_ZO(1.2f, ASPECT_RATIO, 0.1f, 100.0f);
+    HMM_Mat4 rotX = HMM_Rotate_LH(rot * 0.2f, HMM_V3(1.0f, 0.0f, 0.0f));
+    HMM_Mat4 rotY = HMM_Rotate_LH(rot * 0.3f, HMM_V3(0.0f, 1.0f, 0.0f));
+    HMM_Mat4 view = HMM_Translate(HMM_V3(0.0f, 0.0f, 20.0f)) * (rotY * rotX);
+    HMM_Mat4 view_proj = proj * view;
+
+    for (int i = 0; i < TOTAL_CUBES; i++) {
         float x = (i % GRID_SIZE) - (GRID_SIZE / 2.0f);
         float y = ((i / GRID_SIZE) % GRID_SIZE) - (GRID_SIZE / 2.0f);
         float z = ((i / (GRID_SIZE * GRID_SIZE)) % GRID_SIZE) - (GRID_SIZE / 2.0f);
 
-        // Make them spin differently based on their position
-        float local_rot = rotation_3d * 2.0f + (x * 0.5f);
+        float local_rot = rot * 2.0f + (x * 0.5f);
 
-        // Build the matrix for this specific cube
-        Mat4 model_mat = camera_mat * 
-                         mat4_translation(x * 2.5f, y * 2.5f, z * 2.5f) * 
-                         mat4_rotation(local_rot, local_rot, 0.0f) * 
-                         mat4_scale(0.4f);
+        HMM_Mat4 m_trans = HMM_Translate(HMM_V3(x * 2.5f, y * 2.5f, z * 2.5f));
+        HMM_Mat4 m_rotX  = HMM_Rotate_LH(local_rot, HMM_V3(1.0f, 0.0f, 0.0f));
+        HMM_Mat4 m_rotY  = HMM_Rotate_LH(local_rot, HMM_V3(0.0f, 1.0f, 0.0f));
+        HMM_Mat4 m_scale = HMM_Scale(HMM_V3(0.4f, 0.4f, 0.4f));
+        
+        HMM_Mat4 mvp = view_proj * m_trans * (m_rotY * m_rotX) * m_scale;
 
-        // Project and write to VRAM
-        for (size_t j = 0; j < demo_cube.indices.size(); j += 3) {
-            for (int v = 0; v < 3; v++) {
-                int idx = demo_cube.indices[j + v];
-                Vec3 world = transform_vec3(model_mat, demo_cube.vertices[idx]);
-                
-                float depth = std::max(world.z, 0.1f); 
-                float xP = (world.x / depth) * fov;
-                float yP = (world.y / depth) * fov * ASPECT_RATIO;
+        cmd_list[c++] = 0x02; // SET_MATRIX
+        memcpy(&cmd_list[c], &mvp, sizeof(HMM_Mat4));
+        c += 16; 
 
-                vram_verts[vertex_count++] = {
-                    (xP + 1.0f) * 0.5f * SCREEN_WIDTH,
-                    (1.0f - yP) * 0.5f * SCREEN_HEIGHT,
-                    depth,
-                    demo_cube.colors[idx].r, demo_cube.colors[idx].g, demo_cube.colors[idx].b, 255
-                };
-            }
-        }
+        cmd_list[c++] = 0x04; // DRAW_ARRAYS
+        cmd_list[c++] = VRAM_VERTEX_OFFSET;
+        cmd_list[c++] = 36; 
     }
+    
+    cmd_list[c++] = 0xFF; // END LIST
 
-    // 2. Write Display List to RAM
-    uint32_t* cmd_list = (uint32_t*)&console_ram[VRAM_LIST_OFFSET];
-    uint32_t cmd_idx = 0;
-    
-    cmd_list[cmd_idx++] = 0x01; // CLEAR
-    cmd_list[cmd_idx++] = 0xFF101020; // Very Dark Blue
-    
-    cmd_list[cmd_idx++] = 0x04; // DRAW_ARRAYS
-    cmd_list[cmd_idx++] = VRAM_VERTEX_OFFSET;
-    cmd_list[cmd_idx++] = vertex_count;
-    
-    cmd_list[cmd_idx++] = 0xFF; // END LIST
-
-    // 3. Trigger GPU
     gpu.execute_display_list(VRAM_LIST_OFFSET);
 }
-
 // =============================================================================
 // Libretro Callbacks
 // =============================================================================
@@ -401,7 +424,8 @@ RETRO_API void retro_run(void)
     // Parameters: engine, start_address, until_address, timeout (0=infinite), count (0=infinite)
     // For a game console, you usually run for a set number of instructions or until a specific "Yield" address.
     // For testing, we just run 2 instructions.
-    uc_err err = uc_emu_start(uc, current_pc, 0xFFFFFFFFFFFFFFFF , 0, 1000);
+	constexpr auto cpuIpf = cpuMips * 1000000 / FPS;
+    uc_err err = uc_emu_start(uc, current_pc, 0xFFFFFFFFFFFFFFFF , 0, cpuIpf);
 
     if (err) {
         // Write error to a file
