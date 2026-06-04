@@ -74,7 +74,9 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
     bool done = false;
 
     for (auto& tile : tiles) {
-        tile.triangles.clear();
+        tile.opaque_triangles.clear();
+        tile.punchthrough_triangles.clear();
+        tile.translucent_triangles.clear();
     }
 
     while (!done) {
@@ -159,6 +161,14 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
             case 0x0D: { // LOAD_PROJECTION
                 std::memcpy(&state.projection_matrix, &system_ram[ptr], sizeof(HMM_Mat4));
                 ptr += 64; 
+                break;
+            }
+			case 0x0E: { // SET_RENDER_LIST
+                uint32_t list_type = read_u32(system_ram, ptr);
+                if (list_type <= 2) {
+                    state.current_render_list = static_cast<RenderListType>(list_type);
+                }
+                ptr += 4;
                 break;
             }
             case 0x04: { // DRAW_ARRAYS
@@ -285,7 +295,14 @@ void SpheroidGPU::bin_triangle(const ScreenVertex& v0, const ScreenVertex& v1, c
 
     for (int ty = start_ty; ty <= end_ty; ty++) {
         for (int tx = start_tx; tx <= end_tx; tx++) {
-            tiles[ty * num_tiles_x + tx].triangles.push_back(tri);
+            auto& tile = tiles[ty * num_tiles_x + tx];
+            if (state.current_render_list == RenderListType::OPAQUE_LIST) {
+                tile.opaque_triangles.push_back(tri);
+            } else if (state.current_render_list == RenderListType::PUNCH_THROUGH_LIST) {
+                tile.punchthrough_triangles.push_back(tri);
+            } else if (state.current_render_list == RenderListType::TRANSLUCENT_LIST) {
+                tile.translucent_triangles.push_back(tri);
+            }
         }
     }
 }
@@ -430,7 +447,13 @@ void SpheroidGPU::process_tiles_loop() {
         }
 
         // Render all triangles inside this specific tile
-        for (const auto& tri : tiles[tile_idx].triangles) {
+        for (const auto& tri : tiles[tile_idx].opaque_triangles) {
+            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
+        }
+        for (const auto& tri : tiles[tile_idx].punchthrough_triangles) {
+            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
+        }
+        for (const auto& tri : tiles[tile_idx].translucent_triangles) {
             rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
         }
 

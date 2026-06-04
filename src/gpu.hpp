@@ -8,6 +8,12 @@
 #include <mutex>
 #include <condition_variable>
 
+enum class RenderListType {
+    OPAQUE_LIST = 0,
+    PUNCH_THROUGH_LIST = 1,
+    TRANSLUCENT_LIST = 2
+};
+
 // The vertex format stored in emulated RAM
 struct GPUVertex { 
     float x, y, z; 
@@ -33,7 +39,9 @@ struct BinnedTriangle {
 };
 
 struct Tile {
-    std::vector<BinnedTriangle> triangles;
+    std::vector<BinnedTriangle> opaque_triangles;
+    std::vector<BinnedTriangle> punchthrough_triangles;
+    std::vector<BinnedTriangle> translucent_triangles;
 };
 
 struct GPUState {
@@ -45,6 +53,9 @@ struct GPUState {
     uint32_t tex_height = 0;
     bool texturing_enabled = false;
     
+	RenderListType current_render_list = RenderListType::OPAQUE_LIST;
+
+	
     HMM_Mat4 projection_matrix = HMM_M4D(1.0f); 
     HMM_Mat4 modelview_matrix = HMM_M4D(1.0f);  
     std::vector<HMM_Mat4> matrix_stack;         
