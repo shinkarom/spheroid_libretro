@@ -31,6 +31,7 @@ add_subdirectory(vendor/unicorn)
 add_library(${LIBNAME} SHARED 
 	src/libretro.cpp
 	src/gpu.cpp
+	src/miniaudio.c
 	)
 
 if(MINGW)

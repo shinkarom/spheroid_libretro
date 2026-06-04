@@ -30,9 +30,9 @@ extern "C" {
 // Core Configuration & Globals
 // =============================================================================
 
-constexpr unsigned SCREEN_WIDTH  = 640;
-constexpr unsigned SCREEN_HEIGHT = 480;
-constexpr float ASPECT_RATIO     = 4.f / 3.0f;
+constexpr unsigned SCREEN_WIDTH  = 320;
+constexpr unsigned SCREEN_HEIGHT = 240;
+constexpr float ASPECT_RATIO     = SCREEN_WIDTH * 1.0f / SCREEN_HEIGHT;
 
 constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
 constexpr unsigned FPS = 60;
@@ -219,7 +219,7 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
    info->geometry.base_height  = SCREEN_HEIGHT;
    info->geometry.max_width    = SCREEN_WIDTH;
    info->geometry.max_height   = SCREEN_HEIGHT;
-   info->geometry.aspect_ratio = ASPECT_RATIO;
+   info->geometry.aspect_ratio = 0.0f;
    info->timing.fps            = FPS;
    info->timing.sample_rate    = AUDIO_SAMPLE_RATE;
 }
