@@ -33,9 +33,8 @@ add_library(${LIBNAME} SHARED
 	src/gpu.cpp
 	)
 
-# Embed MinGW standard libraries so Windows DLLs are completely portable
 if(MINGW)
-    target_link_options(${LIBNAME} PRIVATE "-static-libgcc" "-static-libstdc++" "-Wl,-Bstatic" "-lstdc++" "-lpthread" "-Wl,-Bdynamic")
+    target_link_options(${LIBNAME} PRIVATE "-static" "-static-libgcc" "-static-libstdc++" "-Wl,-Bstatic" "-lstdc++" "-lpthread" "-Wl,-Bdynamic")
 endif()
 
 # In-source build output directories
