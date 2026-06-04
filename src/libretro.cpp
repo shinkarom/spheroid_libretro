@@ -37,7 +37,7 @@ constexpr float ASPECT_RATIO     = 4.f / 3.0f;
 constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
 constexpr unsigned FPS = 60;
 constexpr unsigned SAMPLES_PER_FRAME = AUDIO_SAMPLE_RATE / FPS; // 735 samples
-constexpr auto cpuMips = 50;
+constexpr auto cpuMips = 100;
 
 // RAM Configuration (128 MB)
 const uint32_t RAM_SIZE = 128 * 1024 * 1024;

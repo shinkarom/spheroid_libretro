@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 
+// --- Render Lists Enum ---
 enum class RenderListType {
     OPAQUE_LIST = 0,
     PUNCH_THROUGH_LIST = 1,
@@ -24,7 +25,7 @@ struct GPUVertex {
 struct ScreenVertex {
     float x, y, z;
     float inv_w;
-    float r, g, b;
+    float r, g, b, a; // NEW: Alpha Channel
     float u, v;       
 };
 
@@ -39,6 +40,7 @@ struct BinnedTriangle {
 };
 
 struct Tile {
+    // NEW: Three Separate Triangle Bins for TBDR
     std::vector<BinnedTriangle> opaque_triangles;
     std::vector<BinnedTriangle> punchthrough_triangles;
     std::vector<BinnedTriangle> translucent_triangles;
@@ -53,9 +55,9 @@ struct GPUState {
     uint32_t tex_height = 0;
     bool texturing_enabled = false;
     
-	RenderListType current_render_list = RenderListType::OPAQUE_LIST;
-
-	
+    // NEW: Active Render List Tracker
+    RenderListType current_render_list = RenderListType::OPAQUE_LIST;
+    
     HMM_Mat4 projection_matrix = HMM_M4D(1.0f); 
     HMM_Mat4 modelview_matrix = HMM_M4D(1.0f);  
     std::vector<HMM_Mat4> matrix_stack;         
@@ -73,29 +75,30 @@ private:
     int num_tiles_x, num_tiles_y;
     std::vector<Tile> tiles;
 
-    // Deferred clear state (for TBDR-style tile clearing)
     bool pending_clear;
     uint32_t clear_color_val;
     float clear_depth_val;
 
-    // Threading sync
     std::vector<std::thread> workers;
     std::atomic<int> current_tile;
     std::atomic<int> completed_tiles;
     std::atomic<bool> stop_threads;
     std::mutex cv_m;
     std::condition_variable cv_start;
-    std::condition_variable cv_done; // NEW: Allows main thread to sleep
+    std::condition_variable cv_done; 
 
     void bin_triangle(const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2);
     void flush_tiles();
     
-    // Templated rasterizer to eliminate inner-loop branching
-    template <bool TEXTURED, bool DEPTH_TEST>
+    // Templated rasterizer logic (Branchless inner loops)
+    template <bool TEXTURED, bool DEPTH_TEST, RenderListType LIST_TYPE>
     void rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_x, int tile_min_y, int tile_max_x, int tile_max_y);
     
-    void rasterize_binned(const BinnedTriangle& tri, int tile_min_x, int tile_min_y, int tile_max_x, int tile_max_y);
-    void rasterize_triangle(const ScreenVertex& v0, const ScreenVertex& v1, const ScreenVertex& v2);
+    // Dispatchers
+    template <bool TEXTURED, bool DEPTH_TEST>
+    void dispatch_list_type(const BinnedTriangle& tri, int min_x, int min_y, int max_x, int max_y, RenderListType list_type);
+    
+    void rasterize_binned(const BinnedTriangle& tri, int tile_min_x, int tile_min_y, int tile_max_x, int tile_max_y, RenderListType list_type);
 
     void worker_thread();
     void process_tiles_loop();

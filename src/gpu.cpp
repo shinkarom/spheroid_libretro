@@ -9,7 +9,7 @@
 struct ClipVertex {
     HMM_Vec4 pos;
     float u, v;
-    float r, g, b;
+    float r, g, b, a; // NEW: Alpha Channel
 };
 
 static inline uint32_t read_u32(const uint8_t* ram, uint32_t offset) {
@@ -73,18 +73,22 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
     uint32_t ptr = ram_offset;
     bool done = false;
 
+    // Reset all buckets for the new frame
     for (auto& tile : tiles) {
         tile.opaque_triangles.clear();
         tile.punchthrough_triangles.clear();
         tile.translucent_triangles.clear();
     }
 
+    // Default to opaque at the start of a display list
+    state.current_render_list = RenderListType::OPAQUE_LIST;
+
     while (!done) {
         uint32_t cmd = read_u32(system_ram, ptr);
         ptr += 4;
 
         switch (cmd) {
-            case 0x01: { // CLEAR (Deferred to TBDR flush)
+            case 0x01: { // CLEAR
                 clear_color_val = read_u32(system_ram, ptr);
                 clear_depth_val = -1.0f;
                 pending_clear = true;
@@ -163,7 +167,7 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                 ptr += 64; 
                 break;
             }
-			case 0x0E: { // SET_RENDER_LIST
+            case 0x0E: { // SET_RENDER_LIST
                 uint32_t list_type = read_u32(system_ram, ptr);
                 if (list_type <= 2) {
                     state.current_render_list = static_cast<RenderListType>(list_type);
@@ -191,6 +195,7 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                         in_verts[v].r = (float)in.r;
                         in_verts[v].g = (float)in.g;
                         in_verts[v].b = (float)in.b;
+                        in_verts[v].a = (float)in.a; // Pass alpha
                     }
 
                     ClipVertex out_verts[4]; 
@@ -222,6 +227,7 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                             intersect.r = v1.r + (v2.r - v1.r) * t;
                             intersect.g = v1.g + (v2.g - v1.g) * t;
                             intersect.b = v1.b + (v2.b - v1.b) * t;
+                            intersect.a = v1.a + (v2.a - v1.a) * t; // Interpolate alpha
 
                             out_verts[out_count++] = intersect;
                         }
@@ -244,6 +250,7 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                             screen_verts[v].r = poly[v]->r * inv_w;
                             screen_verts[v].g = poly[v]->g * inv_w;
                             screen_verts[v].b = poly[v]->b * inv_w;
+                            screen_verts[v].a = poly[v]->a * inv_w; // Multiply alpha
                             screen_verts[v].u = poly[v]->u * inv_w;
                             screen_verts[v].v = poly[v]->v * inv_w;
                         }
@@ -308,9 +315,9 @@ void SpheroidGPU::bin_triangle(const ScreenVertex& v0, const ScreenVertex& v1, c
 }
 
 // ==============================================================================
-// TEMPLATED RASTERIZER: Eliminates branch prediction misses in the inner loop!
+// TEMPLATED TBDR RASTERIZER
 // ==============================================================================
-template <bool TEXTURED, bool DEPTH_TEST>
+template <bool TEXTURED, bool DEPTH_TEST, RenderListType LIST_TYPE>
 void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_x, int tile_min_y, int tile_max_x, int tile_max_y) {
     const int SUB_BITS = 4;
     const float SUB_MULT = 16.0f; 
@@ -358,6 +365,7 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
     double r0_step = inv_area * tri.v0.r, g0_step = inv_area * tri.v0.g, b0_step = inv_area * tri.v0.b;
     double r1_step = inv_area * tri.v1.r, g1_step = inv_area * tri.v1.g, b1_step = inv_area * tri.v1.b;
     double r2_step = inv_area * tri.v2.r, g2_step = inv_area * tri.v2.g, b2_step = inv_area * tri.v2.b;
+    double a0_step = inv_area * tri.v0.a, a1_step = inv_area * tri.v1.a, a2_step = inv_area * tri.v2.a;
 
     for (int y = minY; y <= maxY; y++) {
         int64_t w0 = row_w0, w1 = row_w1, w2 = row_w2;
@@ -373,14 +381,11 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
                 }
 
                 if (pass_depth) {
-                    if constexpr (DEPTH_TEST) {
-                        depth_buffer[pixel_idx] = interp_inv_w;
-                    }
-
                     float w = 1.0f / interp_inv_w;
                     int r = (int)((float)(w0 * r0_step + w1 * r1_step + w2 * r2_step) * w);
                     int g = (int)((float)(w0 * g0_step + w1 * g1_step + w2 * g2_step) * w);
                     int b = (int)((float)(w0 * b0_step + w1 * b1_step + w2 * b2_step) * w);
+                    int a = (int)((float)(w0 * a0_step + w1 * a1_step + w2 * a2_step) * w);
 
                     if constexpr (TEXTURED) {
                         float u = (float)(w0 * u0_step + w1 * u1_step + w2 * u2_step) * w;
@@ -393,11 +398,35 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
                         r = (r * ((texel >> 16) & 0xFF)) / 255;
                         g = (g * ((texel >> 8) & 0xFF)) / 255;
                         b = (b * (texel & 0xFF)) / 255;
+                        a = (a * ((texel >> 24) & 0xFF)) / 255;
+                    }
+
+                    if constexpr (LIST_TYPE == RenderListType::PUNCH_THROUGH_LIST) {
+                        if (a < 128) {
+                            w0 += stepX_w0; w1 += stepX_w1; w2 += stepX_w2; pixel_idx++;
+                            continue; 
+                        }
                     }
 
                     r = std::clamp(r, 0, 255);
                     g = std::clamp(g, 0, 255);
                     b = std::clamp(b, 0, 255);
+                    a = std::clamp(a, 0, 255);
+
+                    if constexpr (LIST_TYPE != RenderListType::TRANSLUCENT_LIST) {
+                        if constexpr (DEPTH_TEST) depth_buffer[pixel_idx] = interp_inv_w;
+                    }
+
+                    if constexpr (LIST_TYPE == RenderListType::TRANSLUCENT_LIST) {
+                        uint32_t bg = color_buffer[pixel_idx];
+                        int bg_r = (bg >> 16) & 0xFF;
+                        int bg_g = (bg >> 8) & 0xFF;
+                        int bg_b = bg & 0xFF;
+                        
+                        r = (r * a + bg_r * (255 - a)) / 255;
+                        g = (g * a + bg_g * (255 - a)) / 255;
+                        b = (b * a + bg_b * (255 - a)) / 255;
+                    }
 
                     color_buffer[pixel_idx] = (255 << 24) | (r << 16) | (g << 8) | b;
                 }
@@ -409,14 +438,25 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
     }
 }
 
-// Dispatcher that calls the correctly optimized template
-void SpheroidGPU::rasterize_binned(const BinnedTriangle& tri, int tile_min_x, int tile_min_y, int tile_max_x, int tile_max_y) {
+template <bool TEXTURED, bool DEPTH_TEST>
+void SpheroidGPU::dispatch_list_type(const BinnedTriangle& tri, int min_x, int min_y, int max_x, int max_y, RenderListType list_type) {
+    switch (list_type) {
+        case RenderListType::OPAQUE_LIST:
+            rasterize_binned_impl<TEXTURED, DEPTH_TEST, RenderListType::OPAQUE_LIST>(tri, min_x, min_y, max_x, max_y); break;
+        case RenderListType::PUNCH_THROUGH_LIST:
+            rasterize_binned_impl<TEXTURED, DEPTH_TEST, RenderListType::PUNCH_THROUGH_LIST>(tri, min_x, min_y, max_x, max_y); break;
+        case RenderListType::TRANSLUCENT_LIST:
+            rasterize_binned_impl<TEXTURED, DEPTH_TEST, RenderListType::TRANSLUCENT_LIST>(tri, min_x, min_y, max_x, max_y); break;
+    }
+}
+
+void SpheroidGPU::rasterize_binned(const BinnedTriangle& tri, int min_x, int min_y, int max_x, int max_y, RenderListType list_type) {
     if (tri.texturing_enabled && tri.texture_ptr) {
-        if (tri.depth_test_enabled) rasterize_binned_impl<true, true>(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
-        else                        rasterize_binned_impl<true, false>(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
+        if (tri.depth_test_enabled) dispatch_list_type<true, true>(tri, min_x, min_y, max_x, max_y, list_type);
+        else                        dispatch_list_type<true, false>(tri, min_x, min_y, max_x, max_y, list_type);
     } else {
-        if (tri.depth_test_enabled) rasterize_binned_impl<false, true>(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
-        else                        rasterize_binned_impl<false, false>(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
+        if (tri.depth_test_enabled) dispatch_list_type<false, true>(tri, min_x, min_y, max_x, max_y, list_type);
+        else                        dispatch_list_type<false, false>(tri, min_x, min_y, max_x, max_y, list_type);
     }
 }
 
@@ -435,7 +475,6 @@ void SpheroidGPU::process_tiles_loop() {
         int tile_max_x = std::min((int)width - 1, tile_min_x + TILE_SIZE - 1);
         int tile_max_y = std::min((int)height - 1, tile_min_y + TILE_SIZE - 1);
 
-        // --- NEW: Distributed Per-Tile Clearing ---
         if (pending_clear) {
             for (int y = tile_min_y; y <= tile_max_y; y++) {
                 int row_idx = y * width;
@@ -446,19 +485,29 @@ void SpheroidGPU::process_tiles_loop() {
             }
         }
 
-        // Render all triangles inside this specific tile
+        // PHASE 1: OPAQUE
         for (const auto& tri : tiles[tile_idx].opaque_triangles) {
-            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
+            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::OPAQUE_LIST);
         }
+        
+        // PHASE 2: PUNCH-THROUGH
         for (const auto& tri : tiles[tile_idx].punchthrough_triangles) {
-            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
-        }
-        for (const auto& tri : tiles[tile_idx].translucent_triangles) {
-            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y);
+            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::PUNCH_THROUGH_LIST);
         }
 
-        // --- NEW: Lock-Free Wakeup condition ---
-        // fetch_add returns the PREVIOUS value. If previous + 1 == total, we are the last thread!
+        // PHASE 3: TRANSLUCENT (Sorted Back-To-Front by average 1/W)
+        std::sort(tiles[tile_idx].translucent_triangles.begin(), 
+                  tiles[tile_idx].translucent_triangles.end(),
+                  [](const BinnedTriangle& a, const BinnedTriangle& b) {
+                      float avg_a = a.v0.inv_w + a.v1.inv_w + a.v2.inv_w;
+                      float avg_b = b.v0.inv_w + b.v1.inv_w + b.v2.inv_w;
+                      return avg_a < avg_b; 
+                  });
+
+        for (const auto& tri : tiles[tile_idx].translucent_triangles) {
+            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::TRANSLUCENT_LIST);
+        }
+
         if (completed_tiles.fetch_add(1) + 1 == total_tiles) {
             std::unique_lock<std::mutex> lock(cv_m);
             cv_done.notify_one();
@@ -488,16 +537,12 @@ void SpheroidGPU::flush_tiles() {
     int total = num_tiles_x * num_tiles_y;
 
     cv_start.notify_all();
-    
-    // The Main Thread ALSO immediately helps draw the tiles
     process_tiles_loop();
 
-    // --- NEW: Sleep instead of Spinlock! ---
     std::unique_lock<std::mutex> lock(cv_m);
     cv_done.wait(lock, [this, total] { 
         return completed_tiles.load() == total; 
     });
 
-    // Reset clear flag for the next frame/display list
     pending_clear = false;
 }
