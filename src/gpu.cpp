@@ -9,7 +9,7 @@
 struct ClipVertex {
     HMM_Vec4 pos;
     float u, v;
-    float r, g, b, a; // NEW: Alpha Channel
+    float r, g, b, a; 
 };
 
 static inline uint32_t read_u32(const uint8_t* ram, uint32_t offset) {
@@ -73,14 +73,14 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
     uint32_t ptr = ram_offset;
     bool done = false;
 
-    // Reset all buckets for the new frame
+    // Reset master pool and all tile bins for the new frame
+    triangle_pool.clear();
     for (auto& tile : tiles) {
-        tile.opaque_triangles.clear();
-        tile.punchthrough_triangles.clear();
-        tile.translucent_triangles.clear();
+        tile.opaque_indices.clear();
+        tile.punchthrough_indices.clear();
+        tile.translucent_indices.clear();
     }
 
-    // Default to opaque at the start of a display list
     state.current_render_list = RenderListType::OPAQUE_LIST;
 
     while (!done) {
@@ -88,19 +88,17 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
         ptr += 4;
 
         switch (cmd) {
-            case 0x01: { // CLEAR
+            case 0x01: { 
                 clear_color_val = read_u32(system_ram, ptr);
                 clear_depth_val = -1.0f;
                 pending_clear = true;
-                ptr += 4;
-                break;
+                ptr += 4; break;
             }
-            case 0x02: { // LOAD_MATRIX
+            case 0x02: { 
                 std::memcpy(&state.modelview_matrix, &system_ram[ptr], sizeof(HMM_Mat4));
-                ptr += 64; 
-                break;
+                ptr += 64; break;
             }
-            case 0x03: { // BIND_TEXTURE
+            case 0x03: { 
                 uint32_t tex_offset = read_u32(system_ram, ptr);
                 state.tex_width     = read_u32(system_ram, ptr + 4);
                 state.tex_height    = read_u32(system_ram, ptr + 8);
@@ -111,69 +109,49 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                     state.texture_ptr = nullptr;
                     state.texturing_enabled = false;
                 }
-                ptr += 12;
-                break;
+                ptr += 12; break;
             }
-            case 0x05: { // PUSH_MATRIX
-                state.matrix_stack.push_back(state.modelview_matrix);
-                break;
-            }
-            case 0x06: { // POP_MATRIX
+            case 0x05: state.matrix_stack.push_back(state.modelview_matrix); break;
+            case 0x06: 
                 if (!state.matrix_stack.empty()) {
                     state.modelview_matrix = state.matrix_stack.back();
                     state.matrix_stack.pop_back();
-                }
-                break;
-            }
-            case 0x07: { // LOAD_IDENTITY
-                state.modelview_matrix = HMM_M4D(1.0f);
-                break;
-            }
-            case 0x08: { // TRANSLATE
-                float x = read_f32(system_ram, ptr);
-                float y = read_f32(system_ram, ptr + 4);
-                float z = read_f32(system_ram, ptr + 8);
+                } break;
+            case 0x07: state.modelview_matrix = HMM_M4D(1.0f); break;
+            case 0x08: { 
+                float x = read_f32(system_ram, ptr); float y = read_f32(system_ram, ptr + 4); float z = read_f32(system_ram, ptr + 8);
                 state.modelview_matrix = state.modelview_matrix * HMM_Translate(HMM_V3(x, y, z));
-                ptr += 12;
-                break;
+                ptr += 12; break;
             }
-            case 0x09: { // ROTATE_X
+            case 0x09: { 
                 float angle = read_f32(system_ram, ptr);
                 state.modelview_matrix = state.modelview_matrix * HMM_Rotate_LH(angle, HMM_V3(1.0f, 0.0f, 0.0f));
                 ptr += 4; break;
             }
-            case 0x0A: { // ROTATE_Y
+            case 0x0A: { 
                 float angle = read_f32(system_ram, ptr);
                 state.modelview_matrix = state.modelview_matrix * HMM_Rotate_LH(angle, HMM_V3(0.0f, 1.0f, 0.0f));
                 ptr += 4; break;
             }
-            case 0x0B: { // SCALE
-                float x = read_f32(system_ram, ptr);
-                float y = read_f32(system_ram, ptr + 4);
-                float z = read_f32(system_ram, ptr + 8);
+            case 0x0B: { 
+                float x = read_f32(system_ram, ptr); float y = read_f32(system_ram, ptr + 4); float z = read_f32(system_ram, ptr + 8);
                 state.modelview_matrix = state.modelview_matrix * HMM_Scale(HMM_V3(x, y, z));
                 ptr += 12; break;
             }
-            case 0x0C: { // SET_PERSPECTIVE
-                float fov = read_f32(system_ram, ptr);
-                float aspect = read_f32(system_ram, ptr + 4);
-                float near_z = read_f32(system_ram, ptr + 8);
-                float far_z = read_f32(system_ram, ptr + 12);
+            case 0x0C: { 
+                float fov = read_f32(system_ram, ptr); float aspect = read_f32(system_ram, ptr + 4);
+                float near_z = read_f32(system_ram, ptr + 8); float far_z = read_f32(system_ram, ptr + 12);
                 state.projection_matrix = HMM_Perspective_LH_ZO(fov, aspect, near_z, far_z);
                 ptr += 16; break;
             }
-            case 0x0D: { // LOAD_PROJECTION
+            case 0x0D: { 
                 std::memcpy(&state.projection_matrix, &system_ram[ptr], sizeof(HMM_Mat4));
-                ptr += 64; 
-                break;
+                ptr += 64; break;
             }
-            case 0x0E: { // SET_RENDER_LIST
+            case 0x0E: { 
                 uint32_t list_type = read_u32(system_ram, ptr);
-                if (list_type <= 2) {
-                    state.current_render_list = static_cast<RenderListType>(list_type);
-                }
-                ptr += 4;
-                break;
+                if (list_type <= 2) state.current_render_list = static_cast<RenderListType>(list_type);
+                ptr += 4; break;
             }
             case 0x04: { // DRAW_ARRAYS
                 uint32_t v_offset = read_u32(system_ram, ptr);
@@ -195,7 +173,7 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                         in_verts[v].r = (float)in.r;
                         in_verts[v].g = (float)in.g;
                         in_verts[v].b = (float)in.b;
-                        in_verts[v].a = (float)in.a; // Pass alpha
+                        in_verts[v].a = (float)in.a; 
                     }
 
                     ClipVertex out_verts[4]; 
@@ -210,9 +188,7 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                         float d1 = v1.pos.W - W_PLANE;
                         float d2 = v2.pos.W - W_PLANE;
 
-                        if (d1 >= 0.0f) {
-                            out_verts[out_count++] = v1;
-                        }
+                        if (d1 >= 0.0f) out_verts[out_count++] = v1;
 
                         if ((d1 >= 0.0f && d2 < 0.0f) || (d1 < 0.0f && d2 >= 0.0f)) {
                             float t = d1 / (d1 - d2);
@@ -227,7 +203,7 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                             intersect.r = v1.r + (v2.r - v1.r) * t;
                             intersect.g = v1.g + (v2.g - v1.g) * t;
                             intersect.b = v1.b + (v2.b - v1.b) * t;
-                            intersect.a = v1.a + (v2.a - v1.a) * t; // Interpolate alpha
+                            intersect.a = v1.a + (v2.a - v1.a) * t; 
 
                             out_verts[out_count++] = intersect;
                         }
@@ -250,7 +226,7 @@ void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
                             screen_verts[v].r = poly[v]->r * inv_w;
                             screen_verts[v].g = poly[v]->g * inv_w;
                             screen_verts[v].b = poly[v]->b * inv_w;
-                            screen_verts[v].a = poly[v]->a * inv_w; // Multiply alpha
+                            screen_verts[v].a = poly[v]->a * inv_w; 
                             screen_verts[v].u = poly[v]->u * inv_w;
                             screen_verts[v].v = poly[v]->v * inv_w;
                         }
@@ -271,18 +247,19 @@ void SpheroidGPU::bin_triangle(const ScreenVertex& v0, const ScreenVertex& v1, c
     const int SUB_BITS = 4;
     const float SUB_MULT = 16.0f; 
 
-    int64_t x0 = (int64_t)std::round(v0.x * SUB_MULT), y0 = (int64_t)std::round(v0.y * SUB_MULT);
-    int64_t x1 = (int64_t)std::round(v1.x * SUB_MULT), y1 = (int64_t)std::round(v1.y * SUB_MULT);
-    int64_t x2 = (int64_t)std::round(v2.x * SUB_MULT), y2 = (int64_t)std::round(v2.y * SUB_MULT);
+    // OPTIMIZATION 1: int32_t instead of int64_t for rasterizer math
+    int32_t x0 = (int32_t)std::round(v0.x * SUB_MULT), y0 = (int32_t)std::round(v0.y * SUB_MULT);
+    int32_t x1 = (int32_t)std::round(v1.x * SUB_MULT), y1 = (int32_t)std::round(v1.y * SUB_MULT);
+    int32_t x2 = (int32_t)std::round(v2.x * SUB_MULT), y2 = (int32_t)std::round(v2.y * SUB_MULT);
 
-    int64_t area = (x2 - x0) * (y1 - y0) - (y2 - y0) * (x1 - x0);
+    int32_t area = (x2 - x0) * (y1 - y0) - (y2 - y0) * (x1 - x0);
     if (state.backface_culling && area <= 0) return;
     if (area == 0) return;
 
-    int minX = std::max(0LL, std::min({x0, x1, x2}) >> SUB_BITS);
-    int minY = std::max(0LL, std::min({y0, y1, y2}) >> SUB_BITS);
-    int maxX = std::min((int64_t)width - 1,  (std::max({x0, x1, x2}) + 15) >> SUB_BITS);
-    int maxY = std::min((int64_t)height - 1, (std::max({y0, y1, y2}) + 15) >> SUB_BITS);
+    int minX = std::max(0, (int)(std::min({x0, x1, x2}) >> SUB_BITS));
+    int minY = std::max(0, (int)(std::min({y0, y1, y2}) >> SUB_BITS));
+    int maxX = std::min((int)width - 1,  (int)((std::max({x0, x1, x2}) + 15) >> SUB_BITS));
+    int maxY = std::min((int)height - 1, (int)((std::max({y0, y1, y2}) + 15) >> SUB_BITS));
 
     if (minX >= (int)width || maxX < 0 || minY >= (int)height || maxY < 0) return;
 
@@ -300,15 +277,19 @@ void SpheroidGPU::bin_triangle(const ScreenVertex& v0, const ScreenVertex& v1, c
     tri.texture_ptr = state.texture_ptr;
     tri.depth_test_enabled = state.depth_test_enabled;
 
+    // OPTIMIZATION 2: Store in master pool, push index to tiles
+    uint32_t tri_idx = (uint32_t)triangle_pool.size();
+    triangle_pool.push_back(tri);
+
     for (int ty = start_ty; ty <= end_ty; ty++) {
         for (int tx = start_tx; tx <= end_tx; tx++) {
             auto& tile = tiles[ty * num_tiles_x + tx];
             if (state.current_render_list == RenderListType::OPAQUE_LIST) {
-                tile.opaque_triangles.push_back(tri);
+                tile.opaque_indices.push_back(tri_idx);
             } else if (state.current_render_list == RenderListType::PUNCH_THROUGH_LIST) {
-                tile.punchthrough_triangles.push_back(tri);
+                tile.punchthrough_indices.push_back(tri_idx);
             } else if (state.current_render_list == RenderListType::TRANSLUCENT_LIST) {
-                tile.translucent_triangles.push_back(tri);
+                tile.translucent_indices.push_back(tri_idx);
             }
         }
     }
@@ -322,11 +303,12 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
     const int SUB_BITS = 4;
     const float SUB_MULT = 16.0f; 
 
-    int64_t x0 = (int64_t)std::round(tri.v0.x * SUB_MULT), y0 = (int64_t)std::round(tri.v0.y * SUB_MULT);
-    int64_t x1 = (int64_t)std::round(tri.v1.x * SUB_MULT), y1 = (int64_t)std::round(tri.v1.y * SUB_MULT);
-    int64_t x2 = (int64_t)std::round(tri.v2.x * SUB_MULT), y2 = (int64_t)std::round(tri.v2.y * SUB_MULT);
+    // OPTIMIZATION 1: int32_t instead of int64_t
+    int32_t x0 = (int32_t)std::round(tri.v0.x * SUB_MULT), y0 = (int32_t)std::round(tri.v0.y * SUB_MULT);
+    int32_t x1 = (int32_t)std::round(tri.v1.x * SUB_MULT), y1 = (int32_t)std::round(tri.v1.y * SUB_MULT);
+    int32_t x2 = (int32_t)std::round(tri.v2.x * SUB_MULT), y2 = (int32_t)std::round(tri.v2.y * SUB_MULT);
 
-    int64_t area = (x2 - x0) * (y1 - y0) - (y2 - y0) * (x1 - x0);
+    int32_t area = (x2 - x0) * (y1 - y0) - (y2 - y0) * (x1 - x0);
     if (area < 0) area = -area;
 
     int minX = std::max(tri.minX, tile_min_x);
@@ -336,22 +318,22 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
 
     if (minX > maxX || minY > maxY) return; 
 
-    int64_t A0 = y2 - y1, B0 = x1 - x2;
-    int64_t A1 = y0 - y2, B1 = x2 - x0;
-    int64_t A2 = y1 - y0, B2 = x0 - x1;
+    int32_t A0 = y2 - y1, B0 = x1 - x2;
+    int32_t A1 = y0 - y2, B1 = x2 - x0;
+    int32_t A2 = y1 - y0, B2 = x0 - x1;
 
-    int64_t px = (minX << SUB_BITS) + 8;
-    int64_t py = (minY << SUB_BITS) + 8;
+    int32_t px = (minX << SUB_BITS) + 8;
+    int32_t py = (minY << SUB_BITS) + 8;
 
-    int64_t row_w0 = (px - x1) * A0 + (py - y1) * B0;
-    int64_t row_w1 = (px - x2) * A1 + (py - y2) * B1;
-    int64_t row_w2 = (px - x0) * A2 + (py - y0) * B2;
+    int32_t row_w0 = (px - x1) * A0 + (py - y1) * B0;
+    int32_t row_w1 = (px - x2) * A1 + (py - y2) * B1;
+    int32_t row_w2 = (px - x0) * A2 + (py - y0) * B2;
 
-    int64_t stepX_w0 = A0 * 16, stepY_w0 = B0 * 16;
-    int64_t stepX_w1 = A1 * 16, stepY_w1 = B1 * 16;
-    int64_t stepX_w2 = A2 * 16, stepY_w2 = B2 * 16;
+    int32_t stepX_w0 = A0 * 16, stepY_w0 = B0 * 16;
+    int32_t stepX_w1 = A1 * 16, stepY_w1 = B1 * 16;
+    int32_t stepX_w2 = A2 * 16, stepY_w2 = B2 * 16;
 
-    auto edge_bias = [](int64_t dy, int64_t dx) -> int64_t {
+    auto edge_bias = [](int32_t dy, int32_t dx) -> int32_t {
         return ((dx > 0) || (dx == 0 && dy < 0)) ? 0 : -1;
     };
     row_w0 += edge_bias(A0, B0);
@@ -368,7 +350,7 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
     double a0_step = inv_area * tri.v0.a, a1_step = inv_area * tri.v1.a, a2_step = inv_area * tri.v2.a;
 
     for (int y = minY; y <= maxY; y++) {
-        int64_t w0 = row_w0, w1 = row_w1, w2 = row_w2;
+        int32_t w0 = row_w0, w1 = row_w1, w2 = row_w2;
         int pixel_idx = y * width + minX;
 
         for (int x = minX; x <= maxX; x++) {
@@ -486,26 +468,28 @@ void SpheroidGPU::process_tiles_loop() {
         }
 
         // PHASE 1: OPAQUE
-        for (const auto& tri : tiles[tile_idx].opaque_triangles) {
-            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::OPAQUE_LIST);
+        for (uint32_t idx : tiles[tile_idx].opaque_indices) {
+            rasterize_binned(triangle_pool[idx], tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::OPAQUE_LIST);
         }
         
         // PHASE 2: PUNCH-THROUGH
-        for (const auto& tri : tiles[tile_idx].punchthrough_triangles) {
-            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::PUNCH_THROUGH_LIST);
+        for (uint32_t idx : tiles[tile_idx].punchthrough_indices) {
+            rasterize_binned(triangle_pool[idx], tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::PUNCH_THROUGH_LIST);
         }
 
         // PHASE 3: TRANSLUCENT (Sorted Back-To-Front by average 1/W)
-        std::sort(tiles[tile_idx].translucent_triangles.begin(), 
-                  tiles[tile_idx].translucent_triangles.end(),
-                  [](const BinnedTriangle& a, const BinnedTriangle& b) {
+        std::sort(tiles[tile_idx].translucent_indices.begin(), 
+                  tiles[tile_idx].translucent_indices.end(),
+                  [this](uint32_t a_idx, uint32_t b_idx) {
+                      const BinnedTriangle& a = triangle_pool[a_idx];
+                      const BinnedTriangle& b = triangle_pool[b_idx];
                       float avg_a = a.v0.inv_w + a.v1.inv_w + a.v2.inv_w;
                       float avg_b = b.v0.inv_w + b.v1.inv_w + b.v2.inv_w;
                       return avg_a < avg_b; 
                   });
 
-        for (const auto& tri : tiles[tile_idx].translucent_triangles) {
-            rasterize_binned(tri, tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::TRANSLUCENT_LIST);
+        for (uint32_t idx : tiles[tile_idx].translucent_indices) {
+            rasterize_binned(triangle_pool[idx], tile_min_x, tile_min_y, tile_max_x, tile_max_y, RenderListType::TRANSLUCENT_LIST);
         }
 
         if (completed_tiles.fetch_add(1) + 1 == total_tiles) {

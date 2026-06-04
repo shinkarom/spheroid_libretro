@@ -25,7 +25,7 @@ struct GPUVertex {
 struct ScreenVertex {
     float x, y, z;
     float inv_w;
-    float r, g, b, a; // NEW: Alpha Channel
+    float r, g, b, a; 
     float u, v;       
 };
 
@@ -40,10 +40,10 @@ struct BinnedTriangle {
 };
 
 struct Tile {
-    // NEW: Three Separate Triangle Bins for TBDR
-    std::vector<BinnedTriangle> opaque_triangles;
-    std::vector<BinnedTriangle> punchthrough_triangles;
-    std::vector<BinnedTriangle> translucent_triangles;
+    // OPTIMIZATION 2: Hold integers (indices) instead of copying massive structs
+    std::vector<uint32_t> opaque_indices;
+    std::vector<uint32_t> punchthrough_indices;
+    std::vector<uint32_t> translucent_indices;
 };
 
 struct GPUState {
@@ -55,7 +55,6 @@ struct GPUState {
     uint32_t tex_height = 0;
     bool texturing_enabled = false;
     
-    // NEW: Active Render List Tracker
     RenderListType current_render_list = RenderListType::OPAQUE_LIST;
     
     HMM_Mat4 projection_matrix = HMM_M4D(1.0f); 
@@ -71,9 +70,13 @@ private:
     uint8_t* system_ram;
     GPUState state;
     
-    static const int TILE_SIZE = 64;
+    // OPTIMIZATION 3: Smaller 32x32 Tiles for better multithreading load balance
+    static const int TILE_SIZE = 32; 
     int num_tiles_x, num_tiles_y;
     std::vector<Tile> tiles;
+    
+    // MASTER TRIANGLE POOL
+    std::vector<BinnedTriangle> triangle_pool;
 
     bool pending_clear;
     uint32_t clear_color_val;

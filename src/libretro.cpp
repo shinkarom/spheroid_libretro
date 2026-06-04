@@ -30,8 +30,8 @@ extern "C" {
 // Core Configuration & Globals
 // =============================================================================
 
-constexpr unsigned SCREEN_WIDTH  = 320;
-constexpr unsigned SCREEN_HEIGHT = 240;
+constexpr unsigned SCREEN_WIDTH  = 640;
+constexpr unsigned SCREEN_HEIGHT = 480;
 constexpr float ASPECT_RATIO     = 4.f / 3.0f;
 
 constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
