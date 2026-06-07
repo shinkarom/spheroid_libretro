@@ -1,3 +1,6 @@
 [submodule "vendor/unicorn"]
 	path = vendor/unicorn
 	url = git@github.com:unicorn-engine/unicorn.git
+[submodule "vendor/wamr"]
+	path = vendor/wamr
+	url = git@github.com:bytecodealliance/wasm-micro-runtime.git

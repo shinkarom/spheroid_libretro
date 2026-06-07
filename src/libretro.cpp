@@ -265,60 +265,78 @@ static void keyboard_cb(bool down, unsigned keycode, uint32_t character, uint16_
 }
 
 RETRO_API bool retro_load_game(const struct retro_game_info *info) {
-   if (!info || !info->path) return false;
-   snprintf(retro_game_path, sizeof(retro_game_path), "%s", info->path);
+    if (!info || !info->path) return false;
 
-   enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
-   if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) return false;
+    snprintf(retro_game_path, sizeof(retro_game_path), "%s", info->path);
 
-   // Setup Interrupt Hook for Syscalls
-   uc_hook_add(uc, &syscall_hook, UC_HOOK_INTR, (void*)syscall_interrupt_cb, nullptr, 1, 0);
+    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) return false;
 
-   // Load ELF File
-   FILE *rom = fopen(retro_game_path, "rb");
-   if (!rom) return false;
-   fseek(rom, 0, SEEK_END);
-   size_t rom_size = ftell(rom);
-   fseek(rom, 0, SEEK_SET);
+    // Setup Interrupt Hook for Syscalls
+    uc_hook_add(uc, &syscall_hook, UC_HOOK_INTR, (void*)syscall_interrupt_cb, nullptr, 1, 0);
 
-   std::vector<uint8_t> elf_data(rom_size);
-   fread(elf_data.data(), 1, rom_size, rom);
-   fclose(rom);
+    // Load ELF File (Relies on need_fullpath = true to handle Zips)
+    FILE *rom = fopen(retro_game_path, "rb");
+    if (!rom) return false;
+    fseek(rom, 0, SEEK_END);
+    size_t rom_size = ftell(rom);
+    fseek(rom, 0, SEEK_SET);
 
-   if (rom_size < sizeof(Elf64_Ehdr)) return false;
-   Elf64_Ehdr* ehdr = (Elf64_Ehdr*)elf_data.data();
+    std::vector<uint8_t> elf_data(rom_size);
+    fread(elf_data.data(), 1, rom_size, rom);
+    fclose(rom);
 
-   if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return false;
-   if (ehdr->e_ident[EI_CLASS] != ELFCLASS64 || ehdr->e_machine != EM_AARCH64) return false;
+    // Validate ELF Header
+    if (rom_size < sizeof(Elf64_Ehdr)) return false;
+    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)elf_data.data();
 
-   Elf64_Phdr* phdr = (Elf64_Phdr*)(elf_data.data() + ehdr->e_phoff);
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return false;
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64 || ehdr->e_machine != EM_AARCH64) return false;
+
+    Elf64_Phdr* phdr = (Elf64_Phdr*)(elf_data.data() + ehdr->e_phoff);
    
-   for (int i = 0; i < ehdr->e_phnum; i++) {
-       if (phdr[i].p_type == PT_LOAD && phdr[i].p_memsz > 0) {
-           uint64_t vaddr = phdr[i].p_vaddr;
-           uint64_t memsz = phdr[i].p_memsz;
-           uint64_t filesz = phdr[i].p_filesz;
-           uint64_t offset = phdr[i].p_offset;
+    // Load Segments directly into the host's console_ram array
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD && phdr[i].p_memsz > 0) {
+            uint64_t vaddr = phdr[i].p_vaddr;
+            uint64_t memsz = phdr[i].p_memsz;
+            uint64_t filesz = phdr[i].p_filesz;
+            uint64_t offset = phdr[i].p_offset;
 
-           if (vaddr >= RAM_BASE_ADDRESS && (vaddr + memsz) <= (RAM_BASE_ADDRESS + RAM_SIZE)) {
-               uint32_t ram_offset = (uint32_t)(vaddr - RAM_BASE_ADDRESS);
-               if (filesz > 0) memcpy(&console_ram[ram_offset], elf_data.data() + offset, filesz);
-               if (memsz > filesz) memset(&console_ram[ram_offset + filesz], 0, memsz - filesz);
-           }
-       }
-   }
+            // Boundary Check: Ensure Linker Script matches Fantasy Console RAM
+            if (vaddr >= RAM_BASE_ADDRESS && (vaddr + memsz) <= (RAM_BASE_ADDRESS + RAM_SIZE)) {
+                uint32_t ram_offset = (uint32_t)(vaddr - RAM_BASE_ADDRESS);
+                
+                // Copy segment data (Code/Data)
+                if (filesz > 0) {
+                    memcpy(&console_ram[ram_offset], elf_data.data() + offset, filesz);
+                }
+                
+                // Zero out BSS (Uninitialized Data)
+                if (memsz > filesz) {
+                    memset(&console_ram[ram_offset + filesz], 0, memsz - filesz);
+                }
+            } else {
+                printf("ERROR: Linker script placed segment outside of RAM bounds! (0x%lx)\n", vaddr);
+                return false;
+            }
+        }
+    }
 
-   uint64_t sp_value = RAM_BASE_ADDRESS + RAM_SIZE;
-   uc_reg_write(uc, UC_ARM64_REG_SP, &sp_value);
+    // Set Stack Pointer to top of RAM and enforce ARM64 16-byte alignment
+    uint64_t sp_value = RAM_BASE_ADDRESS + RAM_SIZE;
+    sp_value &= ~15ULL; // CRUCIAL: Prevents Unicorn from crashing on standard function calls
+    uc_reg_write(uc, UC_ARM64_REG_SP, &sp_value);
 
-   uint64_t pc_value = ehdr->e_entry;
-   uc_reg_write(uc, UC_ARM64_REG_PC, &pc_value);
+    // Set Program Counter to the ELF Entry Point
+    uint64_t pc_value = ehdr->e_entry;
+    uc_reg_write(uc, UC_ARM64_REG_PC, &pc_value);
 
-   struct retro_keyboard_callback kb_cb = { keyboard_cb };
-   environ_cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK, &kb_cb);
+    struct retro_keyboard_callback kb_cb = { keyboard_cb };
+    environ_cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK, &kb_cb);
 
-   retro_reset();
-   return true;
+    retro_reset();
+    return true;
 }
 
 RETRO_API void retro_unload_game(void) {}
