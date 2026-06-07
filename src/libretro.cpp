@@ -1,24 +1,24 @@
 /**
- * Libretro C++ Core: Spheroid (Unicorn Engine - ARM64)
+ * Libretro C++ Core: Spheroid (QuickJS Engine)
  * -----------------------------------------------------------------------------
  * Target Resolution: 320x240 (TBDR Software Renderer)
- * Architecture: ARM64 Guest via Unicorn Engine
- * Interfacing: Syscall (SVC) based hardware abstraction
+ * Architecture: QuickJS JavaScript Runtime
+ * Interfacing: Shared 32MB ArrayBuffer and Native function bindings
  */
 
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdarg>
 #include <cstring>
 #include <cmath>
 #include <vector>
 #include <string>
 
-#include "elf.h"
 #include "gpu.hpp"
+#include "script.hpp"
 #include "HandmadeMath.h"
 #include "libretro.h"
-#include <unicorn/unicorn.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -37,16 +37,16 @@ constexpr float ASPECT_RATIO     = SCREEN_WIDTH * 1.0f / SCREEN_HEIGHT;
 constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
 constexpr unsigned FPS = 60;
 constexpr unsigned SAMPLES_PER_FRAME = AUDIO_SAMPLE_RATE / FPS; // 735 samples
-constexpr auto cpuMips = 100;
 
-// RAM Configuration (128 MB)
-const uint32_t RAM_SIZE = 128 * 1024 * 1024;
-const uint64_t RAM_BASE_ADDRESS = 0x10000000;
+// RAM Configuration (Reduced to 32 MB for JS VRAM/Data)
+const uint32_t RAM_SIZE = 32 * 1024 * 1024;
 static uint8_t* console_ram = nullptr;
 
-constexpr uint32_t VRAM_LIST_OFFSET   = 0x01000000; 
-constexpr uint32_t VRAM_VERTEX_OFFSET = 0x02000000; 
-constexpr uint32_t VRAM_TEXTURE_OFFSET = 0x03000000;
+// VRAM Offsets (Match exactly with JS definitions)
+constexpr uint32_t VRAM_LIST_OFFSET    = 0x00000000; 
+constexpr uint32_t VRAM_VERTEX_OFFSET  = 0x00800000; 
+constexpr uint32_t VRAM_TEXTURE_OFFSET = 0x01000000;
+constexpr uint32_t VRAM_INDEX_OFFSET   = 0x01800000;
 
 // Libretro / Frontend Globals
 static struct retro_log_callback logging;
@@ -57,9 +57,7 @@ char retro_game_path[4096];
 
 // Emulator Subsystems
 static SpheroidGPU gpu;
-static uc_engine *uc = nullptr;
-static uc_context *uc_ctx = nullptr; 
-static uc_hook syscall_hook;
+static SpheroidScript script;
 
 struct CoreState {
    uint32_t frame_count;
@@ -94,48 +92,6 @@ static void generate_audio(int16_t *buffer, size_t num_frames) {
       phase += phase_increment;
       if (phase >= 2.0 * M_PI) phase -= 2.0 * M_PI;
    }
-}
-
-// =============================================================================
-// SYSCALL HANDLER (Replaces MMIO)
-// =============================================================================
-// ABI Convention:
-// X8 = Syscall Number
-// X0, X1, X2 = Arguments
-// =============================================================================
-static void syscall_interrupt_cb(uc_engine *uc, uint32_t intno, void *user_data) {
-    // In Unicorn ARM64, the intno usually maps to the exception type. 
-    // We just need to read the X8 register to see what the guest wants.
-    uint64_t syscall_num = 0;
-    uc_reg_read(uc, UC_ARM64_REG_X8, &syscall_num);
-
-    switch (syscall_num) {
-        case 1: { // SYSCALL 1: DEBUG_PRINT
-            uint64_t char_val = 0;
-            uc_reg_read(uc, UC_ARM64_REG_X0, &char_val);
-            
-            // Buffer characters until a newline is hit, then send to Libretro log
-            static std::string log_buffer;
-            char c = (char)(char_val & 0xFF);
-            if (c == '\n') {
-                if (log_cb) log_cb(RETRO_LOG_INFO, "[GUEST] %s\n", log_buffer.c_str());
-                log_buffer.clear();
-            } else {
-                log_buffer += c;
-            }
-            break;
-        }
-        case 2: { // SYSCALL 2: YIELD (End of Frame)
-            // Immediately pause CPU execution and return control to Libretro frontend.
-            // Unicorn automatically leaves the PC pointing at the NEXT instruction!
-            uc_emu_stop(uc);
-            break;
-        }
-        default: {
-            if (log_cb) log_cb(RETRO_LOG_WARN, "[SYSCALL] Unknown Syscall: %lu\n", syscall_num);
-            break;
-        }
-    }
 }
 
 // =============================================================================
@@ -175,31 +131,22 @@ RETRO_API void retro_init(void) {
    if (environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &sav_dir) && sav_dir)
       snprintf(save_directory, sizeof(save_directory), "%s", sav_dir);
 
-   // Initialize Unicorn Engine
-   uc_err err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &uc);
-   if (err && log_cb) {
-      log_cb(RETRO_LOG_ERROR, "Failed to init Unicorn Engine: %u (%s)\n", err, uc_strerror(err));
-   } else if (uc) {
-      uc_context_alloc(uc, &uc_ctx);
-   }
-   
-   // Allocate and Map 128MB RAM
+   // Allocate 32MB RAM
    console_ram = (uint8_t*)calloc(1, RAM_SIZE);
-   if (console_ram) {
-       err = uc_mem_map_ptr(uc, RAM_BASE_ADDRESS, RAM_SIZE, UC_PROT_ALL, console_ram);
-       if (err != UC_ERR_OK) {
-           if (log_cb) log_cb(RETRO_LOG_ERROR, "Unicorn Failed to map memory: %s\n", uc_strerror(err));
-       }
-   }
 
+   // Initialize GPU
    gpu.init(SCREEN_WIDTH, SCREEN_HEIGHT);
    gpu.set_ram_pointer(console_ram);
+
+   // Initialize QuickJS Scripting Engine
+   if (!script.init(console_ram, RAM_SIZE, log_cb)) {
+       if (log_cb) log_cb(RETRO_LOG_ERROR, "Failed to initialize QuickJS Engine!\n");
+   }
 }
 
 RETRO_API void retro_deinit(void) {
    gpu.shutdown();
-   if (uc_ctx) { uc_free(uc_ctx); uc_ctx = nullptr; }
-   if (uc) { uc_close(uc); uc = nullptr; }
+   script.shutdown();
    if (console_ram) { free(console_ram); console_ram = nullptr; }
 }
 
@@ -208,10 +155,10 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) 
 
 RETRO_API void retro_get_system_info(struct retro_system_info *info) {
    memset(info, 0, sizeof(*info));
-   info->library_name     = "Spheroid";
-   info->library_version  = "0.2";
+   info->library_name     = "Spheroid (JS)";
+   info->library_version  = "0.3";
    info->need_fullpath    = true; 
-   info->valid_extensions = "bin|rom|sph"; 
+   info->valid_extensions = "js"; // Look for JavaScript files now!
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
@@ -219,7 +166,7 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
    info->geometry.base_height  = SCREEN_HEIGHT;
    info->geometry.max_width    = SCREEN_WIDTH;
    info->geometry.max_height   = SCREEN_HEIGHT;
-   info->geometry.aspect_ratio = 0.0f;
+   info->geometry.aspect_ratio = ASPECT_RATIO;
    info->timing.fps            = FPS;
    info->timing.sample_rate    = AUDIO_SAMPLE_RATE;
 }
@@ -233,31 +180,8 @@ RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb
 RETRO_API void retro_reset(void) {
    core_state.frame_count = 0;
    core_state.internal_timer = 0.0;
-   // In the future, re-read the ELF entry point and reset PC/SP here
-}
-
-RETRO_API void retro_run(void) {
-   if (input_poll_cb) input_poll_cb();
-   
-   core_state.frame_count++;
-   
-   uint64_t current_pc;
-   uc_reg_read(uc, UC_ARM64_REG_PC, &current_pc);
-
-   // Run the CPU until a Syscall Yield (uc_emu_stop) or IPF timeout is reached.
-   constexpr auto cpuIpf = cpuMips * 1000000 / FPS;
-   uc_err err = uc_emu_start(uc, current_pc, 0xFFFFFFFFFFFFFFFF, 0, cpuIpf);
-
-   if (err && log_cb) {
-       log_cb(RETRO_LOG_ERROR, "[CPU CRASH] Err: %u (%s) at PC: 0x%lX\n", err, uc_strerror(err), current_pc);
-   }
-
-   gpu.execute_display_list(VRAM_LIST_OFFSET);
-   video_cb(gpu.get_framebuffer(), SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(uint32_t));
-
-   int16_t audio_buf[SAMPLES_PER_FRAME * 2];
-   generate_audio(audio_buf, SAMPLES_PER_FRAME); 
-   audio_batch_cb(audio_buf, SAMPLES_PER_FRAME);
+   // Note: In a JS context, we might want to reload the script here,
+   // or call a dedicated JS `reset()` function in the future.
 }
 
 static void keyboard_cb(bool down, unsigned keycode, uint32_t character, uint16_t mod) {
@@ -272,71 +196,54 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) return false;
 
-    // Setup Interrupt Hook for Syscalls
-    uc_hook_add(uc, &syscall_hook, UC_HOOK_INTR, (void*)syscall_interrupt_cb, nullptr, 1, 0);
-
-    // Load ELF File (Relies on need_fullpath = true to handle Zips)
+    // Load JS File Source Code
     FILE *rom = fopen(retro_game_path, "rb");
-    if (!rom) return false;
+    if (!rom) {
+        if (log_cb) log_cb(RETRO_LOG_ERROR, "Failed to open JS file: %s\n", retro_game_path);
+        return false;
+    }
+    
     fseek(rom, 0, SEEK_END);
-    size_t rom_size = ftell(rom);
+    size_t file_size = ftell(rom);
     fseek(rom, 0, SEEK_SET);
 
-    std::vector<uint8_t> elf_data(rom_size);
-    fread(elf_data.data(), 1, rom_size, rom);
+    std::vector<char> js_code(file_size + 1, '\0'); // +1 for null terminator
+    fread(js_code.data(), 1, file_size, rom);
     fclose(rom);
 
-    // Validate ELF Header
-    if (rom_size < sizeof(Elf64_Ehdr)) return false;
-    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)elf_data.data();
-
-    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return false;
-    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64 || ehdr->e_machine != EM_AARCH64) return false;
-
-    Elf64_Phdr* phdr = (Elf64_Phdr*)(elf_data.data() + ehdr->e_phoff);
-   
-    // Load Segments directly into the host's console_ram array
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD && phdr[i].p_memsz > 0) {
-            uint64_t vaddr = phdr[i].p_vaddr;
-            uint64_t memsz = phdr[i].p_memsz;
-            uint64_t filesz = phdr[i].p_filesz;
-            uint64_t offset = phdr[i].p_offset;
-
-            // Boundary Check: Ensure Linker Script matches Fantasy Console RAM
-            if (vaddr >= RAM_BASE_ADDRESS && (vaddr + memsz) <= (RAM_BASE_ADDRESS + RAM_SIZE)) {
-                uint32_t ram_offset = (uint32_t)(vaddr - RAM_BASE_ADDRESS);
-                
-                // Copy segment data (Code/Data)
-                if (filesz > 0) {
-                    memcpy(&console_ram[ram_offset], elf_data.data() + offset, filesz);
-                }
-                
-                // Zero out BSS (Uninitialized Data)
-                if (memsz > filesz) {
-                    memset(&console_ram[ram_offset + filesz], 0, memsz - filesz);
-                }
-            } else {
-                printf("ERROR: Linker script placed segment outside of RAM bounds! (0x%lx)\n", vaddr);
-                return false;
-            }
-        }
+    // Load and evaluate the script
+    if (!script.load_game(js_code.data(), file_size)) {
+        if (log_cb) log_cb(RETRO_LOG_ERROR, "Script failed to load or evaluate.\n");
+        return false;
     }
-
-    // Set Stack Pointer to top of RAM and enforce ARM64 16-byte alignment
-    uint64_t sp_value = RAM_BASE_ADDRESS + RAM_SIZE;
-    sp_value &= ~15ULL; // CRUCIAL: Prevents Unicorn from crashing on standard function calls
-    uc_reg_write(uc, UC_ARM64_REG_SP, &sp_value);
-
-    // Set Program Counter to the ELF Entry Point
-    uint64_t pc_value = ehdr->e_entry;
-    uc_reg_write(uc, UC_ARM64_REG_PC, &pc_value);
 
     struct retro_keyboard_callback kb_cb = { keyboard_cb };
     environ_cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK, &kb_cb);
 
     retro_reset();
+
+    // Fire the JS init() callback once to let the game set up VRAM/Textures
+    script.call_init();
+
     return true;
+}
+
+RETRO_API void retro_run(void) {
+   if (input_poll_cb) input_poll_cb();
+   
+   core_state.frame_count++;
+
+   // 1. Run Game Logic (JS calls System.print, writes to System.RAM ArrayBuffer)
+   script.call_update();
+
+   // 2. Render Graphics (GPU reads from the C++ console_ram that JS just modified!)
+   gpu.execute_display_list(VRAM_LIST_OFFSET);
+   video_cb(gpu.get_framebuffer(), SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(uint32_t));
+
+   // 3. Audio Output
+   int16_t audio_buf[SAMPLES_PER_FRAME * 2];
+   generate_audio(audio_buf, SAMPLES_PER_FRAME); 
+   audio_batch_cb(audio_buf, SAMPLES_PER_FRAME);
 }
 
 RETRO_API void retro_unload_game(void) {}
@@ -348,10 +255,9 @@ RETRO_API bool retro_load_game_special(unsigned, const struct retro_game_info*, 
 // =============================================================================
 
 RETRO_API size_t retro_serialize_size(void) { 
-   size_t context_size = 0;
-   if (uc && uc_ctx) context_size = uc_context_size(uc);
-   // MUST include RAM_SIZE for savestates to work properly on an emulator!
-   return sizeof(CoreState) + sizeof(sram) + RAM_SIZE + context_size; 
+   // We only need to save the C++ state, SRAM, and the 32MB ArrayBuffer.
+   // (JS Engine internal state is not saved—the JS game must store logic in RAM!)
+   return sizeof(CoreState) + sizeof(sram) + RAM_SIZE; 
 }
 
 RETRO_API bool retro_serialize(void *data, size_t size) {
@@ -361,14 +267,9 @@ RETRO_API bool retro_serialize(void *data, size_t size) {
    memcpy(ptr, &core_state, sizeof(CoreState)); ptr += sizeof(CoreState);
    memcpy(ptr, sram, sizeof(sram)); ptr += sizeof(sram);
    
-   // Save 128MB System RAM
-   memcpy(ptr, console_ram, RAM_SIZE); ptr += RAM_SIZE;
-
-   if (uc && uc_ctx) {
-      uc_context_save(uc, uc_ctx);
-      size_t context_size = uc_context_size(uc);
-      memcpy(ptr, uc_ctx, context_size);
-   }
+   // Save 32MB System RAM (Contains textures, VRAM, and whatever JS put there)
+   memcpy(ptr, console_ram, RAM_SIZE); 
+   
    return true;
 }
 
@@ -379,14 +280,9 @@ RETRO_API bool retro_unserialize(const void *data, size_t size) {
    memcpy(&core_state, ptr, sizeof(CoreState)); ptr += sizeof(CoreState);
    memcpy(sram, ptr, sizeof(sram)); ptr += sizeof(sram);
    
-   // Restore 128MB System RAM
-   memcpy(console_ram, ptr, RAM_SIZE); ptr += RAM_SIZE;
-
-   if (uc && uc_ctx) {
-      size_t context_size = uc_context_size(uc);
-      memcpy(uc_ctx, ptr, context_size);
-      uc_context_restore(uc, uc_ctx);
-   }
+   // Restore 32MB System RAM
+   memcpy(console_ram, ptr, RAM_SIZE); 
+   
    return true;
 }
 
