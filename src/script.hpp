@@ -23,7 +23,8 @@ public:
 
     // Compile and execute the main JS file as an ES6 Module
     bool load_game(const char* js_source, size_t source_size);
-
+	void update_inputs(const uint16_t* pad_states);
+	
     void call_init();
     void call_update();
 
@@ -56,4 +57,10 @@ private:
     static JSValue js_fs_seek(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
     static JSValue js_fs_tell(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
     static JSValue js_fs_close(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+	
+	uint16_t current_pad_state[4] = {0};
+
+    // Native JS Input Binding
+    static JSValue js_input_pressed(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+	static JSValue js_input_get_pad_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 };

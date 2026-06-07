@@ -241,6 +241,22 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
 RETRO_API void retro_run(void) {
    if (input_poll_cb) input_poll_cb();
    
+   // Poll all 16 buttons for up to 4 players
+   uint16_t pad_states[4] = {0};
+   if (input_state_cb) {
+       for (int port = 0; port < 4; port++) {
+           for (int btn = 0; btn < 16; btn++) {
+               // RETRO_DEVICE_JOYPAD = 1
+               if (input_state_cb(port, 1, 0, btn)) {
+                   pad_states[port] |= (1 << btn);
+               }
+           }
+       }
+   }
+   
+   // Push the input state to the JS Engine
+   script.update_inputs(pad_states);
+
    core_state.frame_count++;
 
    script.call_update();

@@ -207,7 +207,31 @@ bool SpheroidScript::init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr
     JS_SetPropertyStr(ctx, fs_obj, "SEEK_END", JS_NewInt32(ctx, 2));
 
     JS_SetPropertyStr(ctx, system_obj, "fs", fs_obj);
+	
+	JSValue input_obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, input_obj, "pressed", JS_NewCFunction(ctx, js_input_pressed, "pressed", 2));
+    JS_SetPropertyStr(ctx, input_obj, "getPadState", JS_NewCFunction(ctx, js_input_get_pad_state, "getPadState", 1));
 
+    // Define standard RetroPad Buttons as BITMASKS (1 << index)
+    JS_SetPropertyStr(ctx, input_obj, "B",      JS_NewInt32(ctx, 1 << 0));
+    JS_SetPropertyStr(ctx, input_obj, "Y",      JS_NewInt32(ctx, 1 << 1));
+    JS_SetPropertyStr(ctx, input_obj, "SELECT", JS_NewInt32(ctx, 1 << 2));
+    JS_SetPropertyStr(ctx, input_obj, "START",  JS_NewInt32(ctx, 1 << 3));
+    JS_SetPropertyStr(ctx, input_obj, "UP",     JS_NewInt32(ctx, 1 << 4));
+    JS_SetPropertyStr(ctx, input_obj, "DOWN",   JS_NewInt32(ctx, 1 << 5));
+    JS_SetPropertyStr(ctx, input_obj, "LEFT",   JS_NewInt32(ctx, 1 << 6));
+    JS_SetPropertyStr(ctx, input_obj, "RIGHT",  JS_NewInt32(ctx, 1 << 7));
+    JS_SetPropertyStr(ctx, input_obj, "A",      JS_NewInt32(ctx, 1 << 8));
+    JS_SetPropertyStr(ctx, input_obj, "X",      JS_NewInt32(ctx, 1 << 9));
+    JS_SetPropertyStr(ctx, input_obj, "L",      JS_NewInt32(ctx, 1 << 10));
+    JS_SetPropertyStr(ctx, input_obj, "R",      JS_NewInt32(ctx, 1 << 11));
+    JS_SetPropertyStr(ctx, input_obj, "L2",     JS_NewInt32(ctx, 1 << 12));
+    JS_SetPropertyStr(ctx, input_obj, "R2",     JS_NewInt32(ctx, 1 << 13));
+    JS_SetPropertyStr(ctx, input_obj, "L3",     JS_NewInt32(ctx, 1 << 14));
+    JS_SetPropertyStr(ctx, input_obj, "R3",     JS_NewInt32(ctx, 1 << 15));
+
+    JS_SetPropertyStr(ctx, system_obj, "input", input_obj);
+	
     // Expose RAM ArrayBuffer
     JSValue ram_buffer = JS_NewArrayBuffer(ctx, ram_ptr, ram_size, dummy_free_ram, nullptr, false);
     JS_SetPropertyStr(ctx, system_obj, "RAM", ram_buffer);
@@ -292,4 +316,41 @@ void SpheroidScript::call_update() {
             break;
         }
     }
+}
+
+// =============================================================================
+// Input API
+// =============================================================================
+void SpheroidScript::update_inputs(const uint16_t* pad_states) {
+    for (int i = 0; i < 4; i++) {
+        current_pad_state[i] = pad_states[i];
+    }
+}
+
+JSValue SpheroidScript::js_input_pressed(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    if (!script) return JS_FALSE;
+
+    int32_t port, button_mask;
+    JS_ToInt32(ctx, &port, argv[0]);
+    JS_ToInt32(ctx, &button_mask, argv[1]);
+
+    if (port < 0 || port >= 4) return JS_FALSE;
+
+    // We now use the mask directly!
+    bool is_pressed = (script->current_pad_state[port] & button_mask) == button_mask;
+    return JS_NewBool(ctx, is_pressed);
+}
+
+// NEW: Expose the raw 16-bit hardware register
+JSValue SpheroidScript::js_input_get_pad_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    if (!script) return JS_NewInt32(ctx, 0);
+
+    int32_t port;
+    JS_ToInt32(ctx, &port, argv[0]);
+
+    if (port < 0 || port >= 4) return JS_NewInt32(ctx, 0);
+
+    return JS_NewInt32(ctx, script->current_pad_state[port]);
 }
