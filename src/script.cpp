@@ -189,31 +189,42 @@ bool SpheroidScript::init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr
     JS_SetModuleLoaderFunc(rt, nullptr, module_loader, this);
 
     // Create System object
-    JSValue global_obj = JS_GetGlobalObject(ctx);
+     JSValue global_obj = JS_GetGlobalObject(ctx);
     JSValue system_obj = JS_NewObject(ctx);
 
+    // 1. System.print
     JS_SetPropertyStr(ctx, system_obj, "print", JS_NewCFunction(ctx, js_print, "print", 1));
 
-    // Create System.fs object
+    // 2. System.fs
     JSValue fs_obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, fs_obj, "open", JS_NewCFunction(ctx, js_fs_open, "open", 2));
-    JS_SetPropertyStr(ctx, fs_obj, "read", JS_NewCFunction(ctx, js_fs_read, "read", 3));
-    JS_SetPropertyStr(ctx, fs_obj, "seek", JS_NewCFunction(ctx, js_fs_seek, "seek", 3));
-    JS_SetPropertyStr(ctx, fs_obj, "tell", JS_NewCFunction(ctx, js_fs_tell, "tell", 1));
+    JS_SetPropertyStr(ctx, fs_obj, "open",  JS_NewCFunction(ctx, js_fs_open, "open", 2));
+    JS_SetPropertyStr(ctx, fs_obj, "read",  JS_NewCFunction(ctx, js_fs_read, "read", 3));
+    JS_SetPropertyStr(ctx, fs_obj, "seek",  JS_NewCFunction(ctx, js_fs_seek, "seek", 3));
+    JS_SetPropertyStr(ctx, fs_obj, "tell",  JS_NewCFunction(ctx, js_fs_tell, "tell", 1));
     JS_SetPropertyStr(ctx, fs_obj, "close", JS_NewCFunction(ctx, js_fs_close, "close", 1));
-
-    // System.fs constants
     JS_SetPropertyStr(ctx, fs_obj, "SEEK_SET", JS_NewInt32(ctx, 0));
     JS_SetPropertyStr(ctx, fs_obj, "SEEK_CUR", JS_NewInt32(ctx, 1));
     JS_SetPropertyStr(ctx, fs_obj, "SEEK_END", JS_NewInt32(ctx, 2));
-
     JS_SetPropertyStr(ctx, system_obj, "fs", fs_obj);
-	
-	JSValue input_obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, input_obj, "pressed", JS_NewCFunction(ctx, js_input_pressed, "pressed", 2));
-    JS_SetPropertyStr(ctx, input_obj, "getPadState", JS_NewCFunction(ctx, js_input_get_pad_state, "getPadState", 1));
 
-    // Define standard RetroPad Buttons as BITMASKS (1 << index)
+    // 3. System.audio
+    JSValue audio_obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, audio_obj, "load",      JS_NewCFunction(ctx, js_audio_load, "load", 1));
+    JS_SetPropertyStr(ctx, audio_obj, "unload",    JS_NewCFunction(ctx, js_audio_unload, "unload", 1));
+    JS_SetPropertyStr(ctx, audio_obj, "play",      JS_NewCFunction(ctx, js_audio_play, "play", 5));
+    JS_SetPropertyStr(ctx, audio_obj, "stop",      JS_NewCFunction(ctx, js_audio_stop, "stop", 1));
+    JS_SetPropertyStr(ctx, audio_obj, "stopAll",   JS_NewCFunction(ctx, js_audio_stop_all, "stopAll", 0));
+    JS_SetPropertyStr(ctx, audio_obj, "setVolume", JS_NewCFunction(ctx, js_audio_set_volume, "setVolume", 2));
+    JS_SetPropertyStr(ctx, audio_obj, "setPitch",  JS_NewCFunction(ctx, js_audio_set_pitch, "setPitch", 2));
+    JS_SetPropertyStr(ctx, audio_obj, "setPan",    JS_NewCFunction(ctx, js_audio_set_pan, "setPan", 2));
+    JS_SetPropertyStr(ctx, system_obj, "audio", audio_obj);
+
+    // 4. System.input
+    JSValue input_obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, input_obj, "pressed",     JS_NewCFunction(ctx, js_input_pressed, "pressed", 2));
+    JS_SetPropertyStr(ctx, input_obj, "getPadState", JS_NewCFunction(ctx, js_input_get_pad_state, "getPadState", 1));
+    
+    // RetroPad Bitmasks
     JS_SetPropertyStr(ctx, input_obj, "B",      JS_NewInt32(ctx, 1 << 0));
     JS_SetPropertyStr(ctx, input_obj, "Y",      JS_NewInt32(ctx, 1 << 1));
     JS_SetPropertyStr(ctx, input_obj, "SELECT", JS_NewInt32(ctx, 1 << 2));
@@ -230,46 +241,13 @@ bool SpheroidScript::init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr
     JS_SetPropertyStr(ctx, input_obj, "R2",     JS_NewInt32(ctx, 1 << 13));
     JS_SetPropertyStr(ctx, input_obj, "L3",     JS_NewInt32(ctx, 1 << 14));
     JS_SetPropertyStr(ctx, input_obj, "R3",     JS_NewInt32(ctx, 1 << 15));
-
     JS_SetPropertyStr(ctx, system_obj, "input", input_obj);
-	
-	JSValue audio_obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, audio_obj, "write", JS_NewCFunction(ctx, js_apu_write, "write", 3));
-    JS_SetPropertyStr(ctx, audio_obj, "read", JS_NewCFunction(ctx, js_apu_read, "read", 2));
-    JS_SetPropertyStr(ctx, audio_obj, "writeGlobal", JS_NewCFunction(ctx, js_apu_write_global, "writeGlobal", 2));
-    JS_SetPropertyStr(ctx, audio_obj, "readGlobal", JS_NewCFunction(ctx, js_apu_read_global, "readGlobal", 1));
 
-    // Expose APU Constants
-    JS_SetPropertyStr(ctx, audio_obj, "REG_START_ADDR",   JS_NewInt32(ctx, SpheroidAPU::REG_START_ADDR));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_END_ADDR",     JS_NewInt32(ctx, SpheroidAPU::REG_END_ADDR));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_LOOP_ADDR",    JS_NewInt32(ctx, SpheroidAPU::REG_LOOP_ADDR));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_LOOP_ENABLE",  JS_NewInt32(ctx, SpheroidAPU::REG_LOOP_ENABLE));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_PITCH",        JS_NewInt32(ctx, SpheroidAPU::REG_PITCH));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_VOL_LEFT",     JS_NewInt32(ctx, SpheroidAPU::REG_VOL_LEFT));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_VOL_RIGHT",    JS_NewInt32(ctx, SpheroidAPU::REG_VOL_RIGHT));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_ADSR_ATTACK",  JS_NewInt32(ctx, SpheroidAPU::REG_ADSR_ATTACK));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_ADSR_DECAY",   JS_NewInt32(ctx, SpheroidAPU::REG_ADSR_DECAY));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_ADSR_SUSTAIN", JS_NewInt32(ctx, SpheroidAPU::REG_ADSR_SUSTAIN));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_ADSR_RELEASE", JS_NewInt32(ctx, SpheroidAPU::REG_ADSR_RELEASE));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_DELAY_SEND",   JS_NewInt32(ctx, SpheroidAPU::REG_DELAY_SEND));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_CHANNELS",     JS_NewInt32(ctx, SpheroidAPU::REG_CHANNELS));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_PLAY_POS",     JS_NewInt32(ctx, SpheroidAPU::REG_PLAY_POS));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_ENV_LEVEL",    JS_NewInt32(ctx, SpheroidAPU::REG_ENV_LEVEL));
-
-    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_KEYON",       JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_KEYON));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_KEYOFF",      JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_KEYOFF));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_DELAY_LEN",   JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_DELAY_LEN));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_DELAY_FB",    JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_DELAY_FB));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_DELAY_VOL_L", JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_DELAY_VOL_L));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_DELAY_VOL_R", JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_DELAY_VOL_R));
-    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_STATUS",      JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_STATUS));
-
-    JS_SetPropertyStr(ctx, system_obj, "audio", audio_obj);
-	
-    // Expose RAM ArrayBuffer
+    // 5. Expose RAM ArrayBuffer (Required for GPU until we upgrade it!)
     JSValue ram_buffer = JS_NewArrayBuffer(ctx, ram_ptr, ram_size, dummy_free_ram, nullptr, false);
     JS_SetPropertyStr(ctx, system_obj, "RAM", ram_buffer);
 
+    // 6. Push 'System' to the Global Namespace
     JS_SetPropertyStr(ctx, global_obj, "System", system_obj);
     JS_FreeValue(ctx, global_obj);
 
@@ -389,38 +367,95 @@ JSValue SpheroidScript::js_input_get_pad_state(JSContext *ctx, JSValueConst this
     return JS_NewInt32(ctx, script->current_pad_state[port]);
 }
 
-JSValue SpheroidScript::js_apu_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+// =============================================================================
+// Native JS Audio API (High-Level)
+// =============================================================================
+
+JSValue SpheroidScript::js_audio_load(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
-    int32_t ch, reg, val;
-    JS_ToInt32(ctx, &ch, argv[0]);
-    JS_ToInt32(ctx, &reg, argv[1]);
-    JS_ToInt32(ctx, &val, argv[2]);
-    if (script && script->apu) script->apu->write(ch, reg, val);
+    if (!script || !script->apu || argc < 1) return JS_NewInt32(ctx, -1);
+
+    const char* filepath = JS_ToCString(ctx, argv[0]);
+    if (!filepath) return JS_NewInt32(ctx, -1);
+
+    int id = script->apu->load_sound(filepath);
+    JS_FreeCString(ctx, filepath);
+
+    return JS_NewInt32(ctx, id);
+}
+
+JSValue SpheroidScript::js_audio_unload(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    if (!script || !script->apu || argc < 1) return JS_UNDEFINED;
+
+    int32_t id;
+    if (JS_ToInt32(ctx, &id, argv[0]) == 0) {
+        script->apu->unload_sound(id);
+    }
     return JS_UNDEFINED;
 }
 
-JSValue SpheroidScript::js_apu_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+JSValue SpheroidScript::js_audio_play(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
-    int32_t ch, reg;
-    JS_ToInt32(ctx, &ch, argv[0]);
-    JS_ToInt32(ctx, &reg, argv[1]);
-    if (script && script->apu) return JS_NewInt32(ctx, script->apu->read(ch, reg));
-    return JS_NewInt32(ctx, 0);
+    if (!script || !script->apu || argc < 1) return JS_NewInt32(ctx, -1);
+
+    int32_t id;
+    JS_ToInt32(ctx, &id, argv[0]);
+
+    // Optional parameters with safe defaults
+    double volume = 1.0, pitch = 1.0, pan = 0.0;
+    bool loop = false;
+
+    if (argc > 1 && !JS_IsUndefined(argv[1])) JS_ToFloat64(ctx, &volume, argv[1]);
+    if (argc > 2 && !JS_IsUndefined(argv[2])) JS_ToFloat64(ctx, &pitch, argv[2]);
+    if (argc > 3 && !JS_IsUndefined(argv[3])) JS_ToFloat64(ctx, &pan, argv[3]);
+    if (argc > 4 && !JS_IsUndefined(argv[4])) loop = JS_ToBool(ctx, argv[4]);
+
+    int voice_id = script->apu->play(id, (float)volume, (float)pitch, (float)pan, loop);
+    return JS_NewInt32(ctx, voice_id);
 }
 
-JSValue SpheroidScript::js_apu_write_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+JSValue SpheroidScript::js_audio_stop(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
-    int32_t reg, val;
-    JS_ToInt32(ctx, &reg, argv[0]);
-    JS_ToInt32(ctx, &val, argv[1]);
-    if (script && script->apu) script->apu->writeGlobal(reg, val);
+    if (!script || !script->apu || argc < 1) return JS_UNDEFINED;
+    
+    int32_t voice_id;
+    if (JS_ToInt32(ctx, &voice_id, argv[0]) == 0) script->apu->stop(voice_id);
     return JS_UNDEFINED;
 }
 
-JSValue SpheroidScript::js_apu_read_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+JSValue SpheroidScript::js_audio_stop_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
-    int32_t reg;
-    JS_ToInt32(ctx, &reg, argv[0]);
-    if (script && script->apu) return JS_NewInt32(ctx, script->apu->readGlobal(reg));
-    return JS_NewInt32(ctx, 0);
+    if (script && script->apu) script->apu->stop_all();
+    return JS_UNDEFINED;
+}
+
+JSValue SpheroidScript::js_audio_set_volume(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    if (script && script->apu && argc >= 2) {
+        int32_t voice_id; double vol;
+        JS_ToInt32(ctx, &voice_id, argv[0]); JS_ToFloat64(ctx, &vol, argv[1]);
+        script->apu->set_volume(voice_id, (float)vol);
+    }
+    return JS_UNDEFINED;
+}
+
+JSValue SpheroidScript::js_audio_set_pitch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    if (script && script->apu && argc >= 2) {
+        int32_t voice_id; double pitch;
+        JS_ToInt32(ctx, &voice_id, argv[0]); JS_ToFloat64(ctx, &pitch, argv[1]);
+        script->apu->set_pitch(voice_id, (float)pitch);
+    }
+    return JS_UNDEFINED;
+}
+
+JSValue SpheroidScript::js_audio_set_pan(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    if (script && script->apu && argc >= 2) {
+        int32_t voice_id; double pan;
+        JS_ToInt32(ctx, &voice_id, argv[0]); JS_ToFloat64(ctx, &pan, argv[1]);
+        script->apu->set_pan(voice_id, (float)pan);
+    }
+    return JS_UNDEFINED;
 }

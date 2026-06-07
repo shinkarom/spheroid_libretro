@@ -2,90 +2,55 @@
 
 #include <cstdint>
 #include <cstddef>
-#include "miniaudio.h"
-#include <libretro.h>
+#include <vector>
+#include <unordered_map>
+#include "vfs.hpp"
 
 class SpheroidAPU {
 public:
-    // =========================================================================
-    // Register Map Constants
-    // =========================================================================
-    
-    // Per-Channel Registers (0x00 - 0x0D)
-    static constexpr uint32_t REG_START_ADDR   = 0x00;
-    static constexpr uint32_t REG_END_ADDR     = 0x01;
-    static constexpr uint32_t REG_LOOP_ADDR    = 0x02; // (Not used natively by miniaudio buffer yet, defaults to start)
-    static constexpr uint32_t REG_LOOP_ENABLE  = 0x03;
-    static constexpr uint32_t REG_PITCH        = 0x04; // 0x1000 = 1.0x
-    static constexpr uint32_t REG_VOL_LEFT     = 0x05; // 0 - 0x3FFF
-    static constexpr uint32_t REG_VOL_RIGHT    = 0x06; // 0 - 0x3FFF
-    static constexpr uint32_t REG_ADSR_ATTACK  = 0x07; // Attack time in MS
-    static constexpr uint32_t REG_ADSR_DECAY   = 0x08; // (Handled via miniaudio fades)
-    static constexpr uint32_t REG_ADSR_SUSTAIN = 0x09; // (Handled via miniaudio fades)
-    static constexpr uint32_t REG_ADSR_RELEASE = 0x0A; // Release time in MS
-    static constexpr uint32_t REG_DELAY_SEND   = 0x0B; // (Reserved for future reverb node)
-    static constexpr uint32_t REG_CHANNELS     = 0x0C; // 1 = Mono, 2 = Stereo
-    static constexpr uint32_t REG_PLAY_POS     = 0x0D; // [Read-Only] Absolute RAM Addr
-    static constexpr uint32_t REG_ENV_LEVEL    = 0x0E; // [Read-Only] 0 - 0x3FFF
-
-    // Global Registers
-    static constexpr uint32_t REG_GLOBAL_KEYON       = 0x100;
-    static constexpr uint32_t REG_GLOBAL_KEYOFF      = 0x101;
-    static constexpr uint32_t REG_GLOBAL_DELAY_LEN   = 0x102;
-    static constexpr uint32_t REG_GLOBAL_DELAY_FB    = 0x103;
-    static constexpr uint32_t REG_GLOBAL_DELAY_VOL_L = 0x104;
-    static constexpr uint32_t REG_GLOBAL_DELAY_VOL_R = 0x105;
-    static constexpr uint32_t REG_GLOBAL_STATUS      = 0x106; // [Read-Only] Active mask
-
-    // =========================================================================
-
     SpheroidAPU() = default;
+    ~SpheroidAPU() = default;
 
-    void init(uint8_t* ram, size_t ram_size, uint32_t sample_rate, retro_log_printf_t log_cb);
+    void init(VFSManager* vfs_mgr, uint32_t sample_rate);
+    void shutdown();
 
-    // Memory-mapped Register API
-    void write(uint32_t ch, uint32_t reg, uint32_t val);
-    uint32_t read(uint32_t ch, uint32_t reg);
-    void writeGlobal(uint32_t reg, uint32_t val);
-    uint32_t readGlobal(uint32_t reg);
+    int load_sound(const char* filepath);
+    void unload_sound(int sound_id);
 
-    // Audio mixing callback (Called by retro_run)
+    int play(int sound_id, float volume, float pitch, float pan, bool loop);
+    void stop(int voice_id);
+    void stop_all();
+
+    void set_volume(int voice_id, float volume);
+    void set_pitch(int voice_id, float pitch);
+    void set_pan(int voice_id, float pan);
+
     void render_frame(int16_t* out_buffer, size_t num_frames);
-	
-	void shutdown();
-	
+
 private:
     static constexpr int NUM_VOICES = 24;
 
-    // The Hardware Register State (What JS writes to)
-    struct VoiceRegs {
-        uint32_t start_addr = 0;
-        uint32_t end_addr = 0;
-        bool loop_enable = false;
-        uint32_t pitch = 0x1000;
-        uint32_t channels = 1;
-
-        float vol_l = 0.0f;
-        float vol_r = 0.0f;
-
-        uint32_t attack_ms = 0;
-        uint32_t release_ms = 0;
-    };
-
-    VoiceRegs regs[NUM_VOICES];
-
-    // Miniaudio Subsystem
-    ma_engine engine;
-    ma_audio_buffer audio_buffers[NUM_VOICES];
-    ma_sound sounds[NUM_VOICES];
-    bool sound_initialized[NUM_VOICES] = {false};
-
-    uint8_t* system_ram = nullptr;
-    size_t system_ram_size = 0;
+    VFSManager* vfs = nullptr;
     uint32_t out_sample_rate = 44100;
 
-	retro_log_printf_t logger = nullptr;
+    struct SoundBuffer {
+        std::vector<int16_t> pcm_data;
+    };
 
-    void key_on(uint32_t mask);
-    void key_off(uint32_t mask);
+    struct Voice {
+        bool active = false;
+        int sound_id = -1;
+        float position = 0.0f; // Floating point for pitch interpolation
+        float pitch = 1.0f;
+        float vol_l = 1.0f;
+        float vol_r = 1.0f;
+        bool loop = false;
+    };
+
+    Voice voices[NUM_VOICES];
+    std::unordered_map<int, SoundBuffer> sound_bank;
+    int next_sound_id = 1;
+
+    // Tiny custom WAV parser
+    bool parse_wav(const std::vector<uint8_t>& file_data, std::vector<int16_t>& out_pcm);
 };

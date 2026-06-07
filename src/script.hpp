@@ -68,8 +68,12 @@ private:
 	SpheroidAPU* apu = nullptr;
 
     // Add the native JS APU bindings
-    static JSValue js_apu_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-    static JSValue js_apu_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-    static JSValue js_apu_write_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-    static JSValue js_apu_read_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_audio_load(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_audio_unload(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_audio_play(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_audio_stop(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_audio_stop_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_audio_set_volume(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_audio_set_pitch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_audio_set_pan(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 };

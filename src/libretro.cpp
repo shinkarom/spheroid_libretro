@@ -32,8 +32,8 @@ extern "C" {
 // Core Configuration & Globals
 // =============================================================================
 
-constexpr unsigned SCREEN_WIDTH  = 320;
-constexpr unsigned SCREEN_HEIGHT = 240;
+constexpr unsigned SCREEN_WIDTH  = 480;
+constexpr unsigned SCREEN_HEIGHT = 270;
 constexpr float ASPECT_RATIO     = SCREEN_WIDTH * 1.0f / SCREEN_HEIGHT;
 
 constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
@@ -128,7 +128,7 @@ RETRO_API void retro_init(void) {
    gpu.init(SCREEN_WIDTH, SCREEN_HEIGHT);
    gpu.set_ram_pointer(console_ram);
 	
-	apu.init(console_ram, RAM_SIZE, AUDIO_SAMPLE_RATE, log_cb);
+	apu.init(&vfs, AUDIO_SAMPLE_RATE);
 	
    // 4. Initialize QuickJS Engine (Pass the VFS Manager to it!)
    if (!script.init(console_ram, RAM_SIZE, &vfs, &apu, log_cb)) {
