@@ -6,6 +6,7 @@
 
 #include "libretro.h"
 #include "vfs.hpp"
+#include "apu.hpp"
 
 extern "C" {
 #include "quickjs.h"
@@ -17,7 +18,7 @@ public:
     ~SpheroidScript() { shutdown(); }
 
     // Initialize the JS Runtime, array buffers, and VFS bindings
-    bool init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr, retro_log_printf_t log_cb);
+    bool init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr, SpheroidAPU* apu_ptr, retro_log_printf_t log_cb);
     
     void shutdown();
 
@@ -63,4 +64,12 @@ private:
     // Native JS Input Binding
     static JSValue js_input_pressed(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 	static JSValue js_input_get_pad_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+	
+	SpheroidAPU* apu = nullptr;
+
+    // Add the native JS APU bindings
+    static JSValue js_apu_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_apu_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_apu_write_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_apu_read_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 };

@@ -170,9 +170,10 @@ JSValue SpheroidScript::js_fs_close(JSContext *ctx, JSValueConst this_val, int a
 // Core Implementation
 // =============================================================================
 
-bool SpheroidScript::init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr, retro_log_printf_t log_cb) {
+bool SpheroidScript::init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr, SpheroidAPU* apu_ptr, retro_log_printf_t log_cb) {
     logger = log_cb;
     vfs = vfs_mgr;
+	apu = apu_ptr;
     system_ram = ram_ptr;
     system_ram_size = ram_size;
 
@@ -231,6 +232,39 @@ bool SpheroidScript::init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr
     JS_SetPropertyStr(ctx, input_obj, "R3",     JS_NewInt32(ctx, 1 << 15));
 
     JS_SetPropertyStr(ctx, system_obj, "input", input_obj);
+	
+	JSValue audio_obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, audio_obj, "write", JS_NewCFunction(ctx, js_apu_write, "write", 3));
+    JS_SetPropertyStr(ctx, audio_obj, "read", JS_NewCFunction(ctx, js_apu_read, "read", 2));
+    JS_SetPropertyStr(ctx, audio_obj, "writeGlobal", JS_NewCFunction(ctx, js_apu_write_global, "writeGlobal", 2));
+    JS_SetPropertyStr(ctx, audio_obj, "readGlobal", JS_NewCFunction(ctx, js_apu_read_global, "readGlobal", 1));
+
+    // Expose APU Constants
+    JS_SetPropertyStr(ctx, audio_obj, "REG_START_ADDR",   JS_NewInt32(ctx, SpheroidAPU::REG_START_ADDR));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_END_ADDR",     JS_NewInt32(ctx, SpheroidAPU::REG_END_ADDR));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_LOOP_ADDR",    JS_NewInt32(ctx, SpheroidAPU::REG_LOOP_ADDR));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_LOOP_ENABLE",  JS_NewInt32(ctx, SpheroidAPU::REG_LOOP_ENABLE));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_PITCH",        JS_NewInt32(ctx, SpheroidAPU::REG_PITCH));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_VOL_LEFT",     JS_NewInt32(ctx, SpheroidAPU::REG_VOL_LEFT));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_VOL_RIGHT",    JS_NewInt32(ctx, SpheroidAPU::REG_VOL_RIGHT));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_ADSR_ATTACK",  JS_NewInt32(ctx, SpheroidAPU::REG_ADSR_ATTACK));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_ADSR_DECAY",   JS_NewInt32(ctx, SpheroidAPU::REG_ADSR_DECAY));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_ADSR_SUSTAIN", JS_NewInt32(ctx, SpheroidAPU::REG_ADSR_SUSTAIN));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_ADSR_RELEASE", JS_NewInt32(ctx, SpheroidAPU::REG_ADSR_RELEASE));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_DELAY_SEND",   JS_NewInt32(ctx, SpheroidAPU::REG_DELAY_SEND));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_CHANNELS",     JS_NewInt32(ctx, SpheroidAPU::REG_CHANNELS));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_PLAY_POS",     JS_NewInt32(ctx, SpheroidAPU::REG_PLAY_POS));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_ENV_LEVEL",    JS_NewInt32(ctx, SpheroidAPU::REG_ENV_LEVEL));
+
+    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_KEYON",       JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_KEYON));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_KEYOFF",      JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_KEYOFF));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_DELAY_LEN",   JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_DELAY_LEN));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_DELAY_FB",    JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_DELAY_FB));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_DELAY_VOL_L", JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_DELAY_VOL_L));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_DELAY_VOL_R", JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_DELAY_VOL_R));
+    JS_SetPropertyStr(ctx, audio_obj, "REG_GLOBAL_STATUS",      JS_NewInt32(ctx, SpheroidAPU::REG_GLOBAL_STATUS));
+
+    JS_SetPropertyStr(ctx, system_obj, "audio", audio_obj);
 	
     // Expose RAM ArrayBuffer
     JSValue ram_buffer = JS_NewArrayBuffer(ctx, ram_ptr, ram_size, dummy_free_ram, nullptr, false);
@@ -353,4 +387,40 @@ JSValue SpheroidScript::js_input_get_pad_state(JSContext *ctx, JSValueConst this
     if (port < 0 || port >= 4) return JS_NewInt32(ctx, 0);
 
     return JS_NewInt32(ctx, script->current_pad_state[port]);
+}
+
+JSValue SpheroidScript::js_apu_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    int32_t ch, reg, val;
+    JS_ToInt32(ctx, &ch, argv[0]);
+    JS_ToInt32(ctx, &reg, argv[1]);
+    JS_ToInt32(ctx, &val, argv[2]);
+    if (script && script->apu) script->apu->write(ch, reg, val);
+    return JS_UNDEFINED;
+}
+
+JSValue SpheroidScript::js_apu_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    int32_t ch, reg;
+    JS_ToInt32(ctx, &ch, argv[0]);
+    JS_ToInt32(ctx, &reg, argv[1]);
+    if (script && script->apu) return JS_NewInt32(ctx, script->apu->read(ch, reg));
+    return JS_NewInt32(ctx, 0);
+}
+
+JSValue SpheroidScript::js_apu_write_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    int32_t reg, val;
+    JS_ToInt32(ctx, &reg, argv[0]);
+    JS_ToInt32(ctx, &val, argv[1]);
+    if (script && script->apu) script->apu->writeGlobal(reg, val);
+    return JS_UNDEFINED;
+}
+
+JSValue SpheroidScript::js_apu_read_global(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    int32_t reg;
+    JS_ToInt32(ctx, &reg, argv[0]);
+    if (script && script->apu) return JS_NewInt32(ctx, script->apu->readGlobal(reg));
+    return JS_NewInt32(ctx, 0);
 }

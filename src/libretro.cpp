@@ -18,6 +18,7 @@
 #include "gpu.hpp"
 #include "script.hpp"
 #include "vfs.hpp"
+#include "apu.hpp"
 #include "HandmadeMath.h"
 #include "libretro.h"
 
@@ -60,6 +61,7 @@ char retro_game_path[4096];
 static SpheroidGPU gpu;
 static SpheroidScript script;
 static VFSManager vfs; // <--- NEW VFS MANAGER
+static SpheroidAPU apu;
 
 struct CoreState {
    uint32_t frame_count;
@@ -81,19 +83,6 @@ static retro_input_state_t input_state_cb;
 static void fallback_log(enum retro_log_level level, const char *fmt, ...) {
    (void)level;
    va_list va; va_start(va, fmt); vfprintf(stderr, fmt, va); va_end(va);
-}
-
-static void generate_audio(int16_t *buffer, size_t num_frames) {
-   static double phase = 0.0;
-   const double phase_increment = (2.0 * M_PI * 440.0) / AUDIO_SAMPLE_RATE;
-
-   for (size_t i = 0; i < num_frames; i++) {
-      int16_t sample = (int16_t)(0x800 * std::sin(phase));
-      buffer[i * 2 + 0] = sample; 
-      buffer[i * 2 + 1] = sample; 
-      phase += phase_increment;
-      if (phase >= 2.0 * M_PI) phase -= 2.0 * M_PI;
-   }
 }
 
 // =============================================================================
@@ -138,9 +127,11 @@ RETRO_API void retro_init(void) {
    // 3. Initialize GPU
    gpu.init(SCREEN_WIDTH, SCREEN_HEIGHT);
    gpu.set_ram_pointer(console_ram);
-
+	
+	apu.init(console_ram, RAM_SIZE, AUDIO_SAMPLE_RATE, log_cb);
+	
    // 4. Initialize QuickJS Engine (Pass the VFS Manager to it!)
-   if (!script.init(console_ram, RAM_SIZE, &vfs, log_cb)) {
+   if (!script.init(console_ram, RAM_SIZE, &vfs, &apu, log_cb)) {
        if (log_cb) log_cb(RETRO_LOG_ERROR, "Failed to initialize QuickJS Engine!\n");
    }
 }
@@ -149,6 +140,7 @@ RETRO_API void retro_deinit(void) {
    gpu.shutdown();
    script.shutdown();
    vfs.close_all();
+   apu.shutdown(); 
    if (console_ram) { free(console_ram); console_ram = nullptr; }
 }
 
@@ -265,7 +257,7 @@ RETRO_API void retro_run(void) {
    video_cb(gpu.get_framebuffer(), SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(uint32_t));
 
    int16_t audio_buf[SAMPLES_PER_FRAME * 2];
-   generate_audio(audio_buf, SAMPLES_PER_FRAME); 
+   apu.render_frame(audio_buf, SAMPLES_PER_FRAME); 
    audio_batch_cb(audio_buf, SAMPLES_PER_FRAME);
 }
 

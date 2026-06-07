@@ -48,6 +48,7 @@ add_library(${LIBNAME} SHARED
     src/gpu.cpp
 	src/script.cpp
 	src/vfs.cpp
+	src/apu.cpp
     src/miniaudio.c
     ${QJS_SOURCES}
 )
