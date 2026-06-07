@@ -4,8 +4,8 @@
 #include <cstddef>
 #include <string>
 
-// Include libretro header for the log callback type
 #include "libretro.h"
+#include "vfs.hpp"
 
 extern "C" {
 #include "quickjs.h"
@@ -16,16 +16,14 @@ public:
     SpheroidScript() = default;
     ~SpheroidScript() { shutdown(); }
 
-    // Initialize the JS Runtime and map the C++ RAM to a JS ArrayBuffer
-    bool init(uint8_t* ram_ptr, size_t ram_size, retro_log_printf_t log_cb);
+    // Initialize the JS Runtime, array buffers, and VFS bindings
+    bool init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr, retro_log_printf_t log_cb);
     
-    // Shut down runtime
     void shutdown();
 
-    // Load and evaluate the JS ROM
+    // Compile and execute the main JS file as an ES6 Module
     bool load_game(const char* js_source, size_t source_size);
 
-    // Execution Hooks
     void call_init();
     void call_update();
 
@@ -37,13 +35,25 @@ private:
     JSValue js_update_func = JS_UNDEFINED;
 
     retro_log_printf_t logger = nullptr;
+    
+    // Core Engine Pointers
+    VFSManager* vfs = nullptr;
+    uint8_t* system_ram = nullptr;
+    size_t system_ram_size = 0;
 
-    // Helper to print JS errors (syntax errors, runtime exceptions) to Libretro
     void print_js_exception();
 
-    // Static wrapper for JS to avoid C++ member function pointer issues
+    // QuickJS Native C Bindings
     static JSValue js_print(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-    
-    // Dummy free function because C++ owns the RAM, not the JS Garbage Collector
     static void dummy_free_ram(JSRuntime *rt, void *opaque, void *ptr) {}
+    
+    // ES6 Module File Loader Callback
+    static JSModuleDef* module_loader(JSContext *ctx, const char *module_name, void *opaque);
+
+    // Native JS FileSystem Bindings
+    static JSValue js_fs_open(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_fs_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_fs_seek(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_fs_tell(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_fs_close(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 };

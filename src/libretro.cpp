@@ -1,5 +1,5 @@
 /**
- * Libretro C++ Core: Spheroid (QuickJS Engine)
+ * Libretro C++ Core: Spheroid
  * -----------------------------------------------------------------------------
  * Target Resolution: 320x240 (TBDR Software Renderer)
  * Architecture: QuickJS JavaScript Runtime
@@ -9,14 +9,15 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
-#include <cstdarg>
 #include <cstring>
 #include <cmath>
+#include <cstdarg>
 #include <vector>
 #include <string>
 
 #include "gpu.hpp"
 #include "script.hpp"
+#include "vfs.hpp"
 #include "HandmadeMath.h"
 #include "libretro.h"
 
@@ -36,13 +37,13 @@ constexpr float ASPECT_RATIO     = SCREEN_WIDTH * 1.0f / SCREEN_HEIGHT;
 
 constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
 constexpr unsigned FPS = 60;
-constexpr unsigned SAMPLES_PER_FRAME = AUDIO_SAMPLE_RATE / FPS; // 735 samples
+constexpr unsigned SAMPLES_PER_FRAME = AUDIO_SAMPLE_RATE / FPS;
 
-// RAM Configuration (Reduced to 32 MB for JS VRAM/Data)
+// RAM Configuration (32 MB)
 const uint32_t RAM_SIZE = 32 * 1024 * 1024;
 static uint8_t* console_ram = nullptr;
 
-// VRAM Offsets (Match exactly with JS definitions)
+// VRAM Offsets (Must match game.js!)
 constexpr uint32_t VRAM_LIST_OFFSET    = 0x00000000; 
 constexpr uint32_t VRAM_VERTEX_OFFSET  = 0x00800000; 
 constexpr uint32_t VRAM_TEXTURE_OFFSET = 0x01000000;
@@ -58,6 +59,7 @@ char retro_game_path[4096];
 // Emulator Subsystems
 static SpheroidGPU gpu;
 static SpheroidScript script;
+static VFSManager vfs; // <--- NEW VFS MANAGER
 
 struct CoreState {
    uint32_t frame_count;
@@ -114,12 +116,6 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
 
    static const struct retro_controller_info ports[] = { { controllers, 4 }, { nullptr, 0 } };
    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
-
-   struct retro_variable variables[] = {
-      { "spheroid_tbdr_threads", "Renderer Threads; 1|2|4|8" },
-      { nullptr, nullptr },
-   };
-   cb(RETRO_ENVIRONMENT_SET_VARIABLES, variables);
 }
 
 RETRO_API void retro_init(void) {
@@ -131,15 +127,20 @@ RETRO_API void retro_init(void) {
    if (environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &sav_dir) && sav_dir)
       snprintf(save_directory, sizeof(save_directory), "%s", sav_dir);
 
-   // Allocate 32MB RAM
+   // 1. Initialize Virtual File System via Libretro
+   struct retro_vfs_interface_info vfs_info = { 1, nullptr };
+   environ_cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_info);
+   vfs.init(vfs_info.iface, sav_dir);
+
+   // 2. Allocate 32MB RAM
    console_ram = (uint8_t*)calloc(1, RAM_SIZE);
 
-   // Initialize GPU
+   // 3. Initialize GPU
    gpu.init(SCREEN_WIDTH, SCREEN_HEIGHT);
    gpu.set_ram_pointer(console_ram);
 
-   // Initialize QuickJS Scripting Engine
-   if (!script.init(console_ram, RAM_SIZE, log_cb)) {
+   // 4. Initialize QuickJS Engine (Pass the VFS Manager to it!)
+   if (!script.init(console_ram, RAM_SIZE, &vfs, log_cb)) {
        if (log_cb) log_cb(RETRO_LOG_ERROR, "Failed to initialize QuickJS Engine!\n");
    }
 }
@@ -147,6 +148,7 @@ RETRO_API void retro_init(void) {
 RETRO_API void retro_deinit(void) {
    gpu.shutdown();
    script.shutdown();
+   vfs.close_all();
    if (console_ram) { free(console_ram); console_ram = nullptr; }
 }
 
@@ -156,9 +158,9 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) 
 RETRO_API void retro_get_system_info(struct retro_system_info *info) {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Spheroid (JS)";
-   info->library_version  = "0.3";
+   info->library_version  = "0.4";
    info->need_fullpath    = true; 
-   info->valid_extensions = "js"; // Look for JavaScript files now!
+   info->valid_extensions = "js|zip|spheroid"; // Allow zips/folders
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
@@ -180,13 +182,9 @@ RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb
 RETRO_API void retro_reset(void) {
    core_state.frame_count = 0;
    core_state.internal_timer = 0.0;
-   // Note: In a JS context, we might want to reload the script here,
-   // or call a dedicated JS `reset()` function in the future.
 }
 
-static void keyboard_cb(bool down, unsigned keycode, uint32_t character, uint16_t mod) {
-   // Hardware Keyboard hook
-}
+static void keyboard_cb(bool down, unsigned keycode, uint32_t character, uint16_t mod) {}
 
 RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     if (!info || !info->path) return false;
@@ -196,24 +194,36 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) return false;
 
-    // Load JS File Source Code
-    FILE *rom = fopen(retro_game_path, "rb");
-    if (!rom) {
-        if (log_cb) log_cb(RETRO_LOG_ERROR, "Failed to open JS file: %s\n", retro_game_path);
+    // 1. Mount the game directory in the VFS
+    vfs.mount_game(retro_game_path);
+
+    // 2. Load "boot.js" via the VFS! (LÖVE2D style boot sequence)
+    std::vector<char> js_code;
+    int fd = vfs.open("boot.js", "r");
+    
+    if (fd >= 0) {
+        vfs.seek(fd, 0, 2); // SEEK_END
+        int64_t size = vfs.tell(fd);
+        vfs.seek(fd, 0, 0); // SEEK_SET
+
+        js_code.resize(size + 1, '\0');
+        vfs.read(fd, js_code.data(), size);
+        vfs.close(fd);
+    } 
+    else if (info->data && info->size > 0) {
+        // Fallback: If they literally loaded a direct JS file that isn't named boot.js
+        js_code.assign((const char*)info->data, (const char*)info->data + info->size);
+        js_code.push_back('\0');
+    } 
+    else {
+        if (log_cb) log_cb(RETRO_LOG_ERROR, "Failed to load boot.js!\n");
         return false;
     }
-    
-    fseek(rom, 0, SEEK_END);
-    size_t file_size = ftell(rom);
-    fseek(rom, 0, SEEK_SET);
 
-    std::vector<char> js_code(file_size + 1, '\0'); // +1 for null terminator
-    fread(js_code.data(), 1, file_size, rom);
-    fclose(rom);
-
-    // Load and evaluate the script
-    if (!script.load_game(js_code.data(), file_size)) {
-        if (log_cb) log_cb(RETRO_LOG_ERROR, "Script failed to load or evaluate.\n");
+    // 3. Load and evaluate the script (We no longer need to pass the filepath 
+    //    because the VFS manager handles directory scoping internally now)
+        if (!script.load_game(js_code.data(), strlen(js_code.data()))) {
+        if (log_cb) log_cb(RETRO_LOG_ERROR, "Script failed to evaluate.\n");
         return false;
     }
 
@@ -222,7 +232,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
 
     retro_reset();
 
-    // Fire the JS init() callback once to let the game set up VRAM/Textures
+    // 4. Fire the JS init() callback
     script.call_init();
 
     return true;
@@ -233,14 +243,11 @@ RETRO_API void retro_run(void) {
    
    core_state.frame_count++;
 
-   // 1. Run Game Logic (JS calls System.print, writes to System.RAM ArrayBuffer)
    script.call_update();
 
-   // 2. Render Graphics (GPU reads from the C++ console_ram that JS just modified!)
    gpu.execute_display_list(VRAM_LIST_OFFSET);
    video_cb(gpu.get_framebuffer(), SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(uint32_t));
 
-   // 3. Audio Output
    int16_t audio_buf[SAMPLES_PER_FRAME * 2];
    generate_audio(audio_buf, SAMPLES_PER_FRAME); 
    audio_batch_cb(audio_buf, SAMPLES_PER_FRAME);
@@ -255,8 +262,6 @@ RETRO_API bool retro_load_game_special(unsigned, const struct retro_game_info*, 
 // =============================================================================
 
 RETRO_API size_t retro_serialize_size(void) { 
-   // We only need to save the C++ state, SRAM, and the 32MB ArrayBuffer.
-   // (JS Engine internal state is not saved—the JS game must store logic in RAM!)
    return sizeof(CoreState) + sizeof(sram) + RAM_SIZE; 
 }
 
@@ -266,8 +271,6 @@ RETRO_API bool retro_serialize(void *data, size_t size) {
    
    memcpy(ptr, &core_state, sizeof(CoreState)); ptr += sizeof(CoreState);
    memcpy(ptr, sram, sizeof(sram)); ptr += sizeof(sram);
-   
-   // Save 32MB System RAM (Contains textures, VRAM, and whatever JS put there)
    memcpy(ptr, console_ram, RAM_SIZE); 
    
    return true;
@@ -279,8 +282,6 @@ RETRO_API bool retro_unserialize(const void *data, size_t size) {
    
    memcpy(&core_state, ptr, sizeof(CoreState)); ptr += sizeof(CoreState);
    memcpy(sram, ptr, sizeof(sram)); ptr += sizeof(sram);
-   
-   // Restore 32MB System RAM
    memcpy(console_ram, ptr, RAM_SIZE); 
    
    return true;
