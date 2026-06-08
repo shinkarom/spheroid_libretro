@@ -1,9 +1,9 @@
 /**
  * Libretro C++ Core: Spheroid
  * -----------------------------------------------------------------------------
- * Target Resolution: 320x240 (TBDR Software Renderer)
+ * Target Resolution: 480x270 (16:9 TBDR Software Renderer)
  * Architecture: QuickJS JavaScript Runtime
- * Interfacing: Shared 32MB ArrayBuffer and Native function bindings
+ * Interfacing: Native JS Bindings (Resource Manager & Command Queue)
  */
 
 #include <cstdio>
@@ -40,15 +40,9 @@ constexpr unsigned AUDIO_SAMPLE_RATE = 44100;
 constexpr unsigned FPS = 60;
 constexpr unsigned SAMPLES_PER_FRAME = AUDIO_SAMPLE_RATE / FPS;
 
-// RAM Configuration (32 MB)
-const uint32_t RAM_SIZE = 32 * 1024 * 1024;
+// JS/System RAM Configuration (16 MB is plenty now that GPU manages its own VRAM)
+const uint32_t RAM_SIZE = 16 * 1024 * 1024;
 static uint8_t* console_ram = nullptr;
-
-// VRAM Offsets (Must match game.js!)
-constexpr uint32_t VRAM_LIST_OFFSET    = 0x00000000; 
-constexpr uint32_t VRAM_VERTEX_OFFSET  = 0x00800000; 
-constexpr uint32_t VRAM_TEXTURE_OFFSET = 0x01000000;
-constexpr uint32_t VRAM_INDEX_OFFSET   = 0x01800000;
 
 // Libretro / Frontend Globals
 static struct retro_log_callback logging;
@@ -60,7 +54,7 @@ char retro_game_path[4096];
 // Emulator Subsystems
 static SpheroidGPU gpu;
 static SpheroidScript script;
-static VFSManager vfs; // <--- NEW VFS MANAGER
+static VFSManager vfs; 
 static SpheroidAPU apu;
 
 struct CoreState {
@@ -99,11 +93,9 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
    static const struct retro_controller_description controllers[] = {
       { "RetroPad", RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 0) },
       { "RetroPad w/ Analog", RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_ANALOG, 0) },
-      { "Mouse", RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_MOUSE, 0) },
-      { "Keyboard", RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_KEYBOARD, 0) },
    };
 
-   static const struct retro_controller_info ports[] = { { controllers, 4 }, { nullptr, 0 } };
+   static const struct retro_controller_info ports[] = { { controllers, 2 }, { nullptr, 0 } };
    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
 }
 
@@ -116,22 +108,23 @@ RETRO_API void retro_init(void) {
    if (environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &sav_dir) && sav_dir)
       snprintf(save_directory, sizeof(save_directory), "%s", sav_dir);
 
-   // 1. Initialize Virtual File System via Libretro
+   // 1. Initialize Virtual File System
    struct retro_vfs_interface_info vfs_info = { 1, nullptr };
    environ_cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_info);
    vfs.init(vfs_info.iface, sav_dir);
 
-   // 2. Allocate 32MB RAM
+   // 2. Allocate System RAM (JS Heap + APU Data)
    console_ram = (uint8_t*)calloc(1, RAM_SIZE);
 
    // 3. Initialize GPU
    gpu.init(SCREEN_WIDTH, SCREEN_HEIGHT);
-   gpu.set_ram_pointer(console_ram);
 	
-	apu.init(&vfs, AUDIO_SAMPLE_RATE);
+   // 4. Initialize APU
+   apu.init(&vfs, AUDIO_SAMPLE_RATE);
 	
-   // 4. Initialize QuickJS Engine (Pass the VFS Manager to it!)
-   if (!script.init(console_ram, RAM_SIZE, &vfs, &apu, log_cb)) {
+   // 5. Initialize QuickJS Engine
+   // NOTE: We now pass the GPU pointer so QuickJS can bind Spheroid.GPU functions!
+   if (!script.init(console_ram, RAM_SIZE, &vfs, &apu, &gpu, log_cb)) {
        if (log_cb) log_cb(RETRO_LOG_ERROR, "Failed to initialize QuickJS Engine!\n");
    }
 }
@@ -149,10 +142,10 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) 
 
 RETRO_API void retro_get_system_info(struct retro_system_info *info) {
    memset(info, 0, sizeof(*info));
-   info->library_name     = "Spheroid (JS)";
-   info->library_version  = "0.4";
+   info->library_name     = "Spheroid";
+   info->library_version  = "1.0";
    info->need_fullpath    = true; 
-   info->valid_extensions = "js|zip|spheroid"; // Allow zips/folders
+   info->valid_extensions = "js|zip|spheroid"; 
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
@@ -186,24 +179,25 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) return false;
 
-    // 1. Mount the game directory in the VFS
     vfs.mount_game(retro_game_path);
 
-    // 2. Load "boot.js" via the VFS! (LÖVE2D style boot sequence)
     std::vector<char> js_code;
     int fd = vfs.open("boot.js", "r");
     
     if (fd >= 0) {
-        vfs.seek(fd, 0, 2); // SEEK_END
+        vfs.seek(fd, 0, 2); 
         int64_t size = vfs.tell(fd);
-        vfs.seek(fd, 0, 0); // SEEK_SET
+        vfs.seek(fd, 0, 0); 
 
         js_code.resize(size + 1, '\0');
-        vfs.read(fd, js_code.data(), size);
+        
+        // Safer read
+        int64_t bytes_read = vfs.read(fd, js_code.data(), size);
+        js_code[bytes_read] = '\0'; 
+        
         vfs.close(fd);
     } 
     else if (info->data && info->size > 0) {
-        // Fallback: If they literally loaded a direct JS file that isn't named boot.js
         js_code.assign((const char*)info->data, (const char*)info->data + info->size);
         js_code.push_back('\0');
     } 
@@ -212,9 +206,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         return false;
     }
 
-    // 3. Load and evaluate the script (We no longer need to pass the filepath 
-    //    because the VFS manager handles directory scoping internally now)
-        if (!script.load_game(js_code.data(), strlen(js_code.data()))) {
+    // Pass the actual length of the string to avoid premature termination issues
+    if (!script.load_game(js_code.data(), js_code.size() - 1)) {
         if (log_cb) log_cb(RETRO_LOG_ERROR, "Script failed to evaluate.\n");
         return false;
     }
@@ -224,7 +217,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
 
     retro_reset();
 
-    // 4. Fire the JS init() callback
+    // Fire the JS init() callback (This is where JS will load meshes/textures into the GPU)
     script.call_init();
 
     return true;
@@ -233,12 +226,10 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
 RETRO_API void retro_run(void) {
    if (input_poll_cb) input_poll_cb();
    
-   // Poll all 16 buttons for up to 4 players
    uint16_t pad_states[4] = {0};
    if (input_state_cb) {
        for (int port = 0; port < 4; port++) {
            for (int btn = 0; btn < 16; btn++) {
-               // RETRO_DEVICE_JOYPAD = 1
                if (input_state_cb(port, 1, 0, btn)) {
                    pad_states[port] |= (1 << btn);
                }
@@ -246,16 +237,20 @@ RETRO_API void retro_run(void) {
        }
    }
    
-   // Push the input state to the JS Engine
    script.update_inputs(pad_states);
 
    core_state.frame_count++;
 
+   // 1. JS Execution: Builds the RenderCommand Queue internally
    script.call_update();
 
-   gpu.execute_display_list(VRAM_LIST_OFFSET);
+   // 2. GPU Execution: Flushes queue to the TBDR worker threads
+   gpu.flush_command_queue();
+   
+   // 3. Output Framebuffer to Libretro
    video_cb(gpu.get_framebuffer(), SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(uint32_t));
 
+   // 4. Audio Processing
    int16_t audio_buf[SAMPLES_PER_FRAME * 2];
    apu.render_frame(audio_buf, SAMPLES_PER_FRAME); 
    audio_batch_cb(audio_buf, SAMPLES_PER_FRAME);
@@ -268,6 +263,8 @@ RETRO_API bool retro_load_game_special(unsigned, const struct retro_game_info*, 
 // =============================================================================
 // Serialization (Savestates & Rewind)
 // =============================================================================
+// TODO: Full savestate support now requires serializing the GPU's internal 
+// std::vector for Textures and Meshes, as they are no longer in system RAM.
 
 RETRO_API size_t retro_serialize_size(void) { 
    return sizeof(CoreState) + sizeof(sram) + RAM_SIZE; 

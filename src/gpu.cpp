@@ -6,30 +6,22 @@
 #include <cstdio>
 #include "HandmadeMath.h"
 
-static inline uint32_t read_u32(const uint8_t* ram, uint32_t offset) {
-    uint32_t val; std::memcpy(&val, &ram[offset], sizeof(uint32_t)); return val;
-}
-static inline float read_f32(const uint8_t* ram, uint32_t offset) {
-    float val; std::memcpy(&val, &ram[offset], sizeof(float)); return val;
-}
-
-SpheroidGPU::SpheroidGPU() : color_buffer(nullptr), depth_buffer(nullptr), system_ram(nullptr), pending_clear(false) {}
+SpheroidGPU::SpheroidGPU() : color_buffer(nullptr), pending_clear(false) {}
 SpheroidGPU::~SpheroidGPU() { shutdown(); }
 
 void SpheroidGPU::init(uint32_t w, uint32_t h) {
     width = w; height = h;
-    color_buffer = new uint32_t[w * h]; depth_buffer = new float[w * h];
+    color_buffer = new uint32_t[w * h];
     std::memset(color_buffer, 0, w * h * sizeof(uint32_t));
-    std::memset(depth_buffer, 0, w * h * sizeof(float));
 
     num_tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
     num_tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
     tiles.resize(num_tiles_x * num_tiles_y);
 
-    screen_vertex_pool.reserve(500000); // Reserve memory to prevent reallocations
+    screen_vertex_pool.reserve(500000); 
     triangle_pool.reserve(200000); 
-    // --- OPTIMIZATION: Pre-allocate a large chunk to prevent stall-inducing resizes ---
     node_arena.resize(5000000);    
+    command_queue.reserve(10000); // Prevent reallocation during frame building
 
     if (workers.empty()) {
         stop_threads.store(false);
@@ -46,11 +38,188 @@ void SpheroidGPU::shutdown() {
     for (auto& t : workers) if (t.joinable()) t.join();
     workers.clear();
     if (color_buffer) { delete[] color_buffer; color_buffer = nullptr; }
-    if (depth_buffer) { delete[] depth_buffer; depth_buffer = nullptr; }
 }
 
-void SpheroidGPU::set_ram_pointer(uint8_t* ram) { system_ram = ram; }
 const uint32_t* SpheroidGPU::get_framebuffer() const { return color_buffer; }
+
+// =============================================================================
+// Resource Management
+// =============================================================================
+
+uint32_t SpheroidGPU::load_texture(uint32_t w, uint32_t h, const uint32_t* pixels) {
+    TextureResource tex;
+    tex.width = w;
+    tex.height = h;
+    tex.pixels.assign(pixels, pixels + (w * h));
+    textures.push_back(std::move(tex));
+    return textures.size(); // 1-based ID
+}
+
+uint32_t SpheroidGPU::load_mesh(const std::vector<GPUVertex>& verts, const std::vector<uint16_t>& indices) {
+    MeshResource mesh;
+    mesh.vertices = verts;
+    mesh.indices = indices;
+    meshes.push_back(std::move(mesh));
+    return meshes.size(); // 1-based ID
+}
+
+// =============================================================================
+// Command Queue Builders
+// =============================================================================
+
+void SpheroidGPU::cmd_clear(uint32_t color) {
+    RenderCommand cmd; cmd.type = CommandType::CLEAR; cmd.clear_color = color;
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_set_render_list(RenderListType type) {
+    RenderCommand cmd; cmd.type = CommandType::SET_RENDER_LIST; cmd.list_type = type;
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_push_matrix() {
+    RenderCommand cmd; cmd.type = CommandType::PUSH_MATRIX;
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_pop_matrix() {
+    RenderCommand cmd; cmd.type = CommandType::POP_MATRIX;
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_load_identity() {
+    RenderCommand cmd; cmd.type = CommandType::LOAD_IDENTITY;
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_load_matrix(const HMM_Mat4& mat) {
+    RenderCommand cmd; cmd.type = CommandType::LOAD_MATRIX; 
+    std::memcpy(cmd.matrix.f, &mat.Elements[0][0], sizeof(float) * 16);
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_translate(float x, float y, float z) {
+    RenderCommand cmd; cmd.type = CommandType::TRANSLATE; cmd.vec3 = {x, y, z};
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_rotate_x(float angle) {
+    RenderCommand cmd; cmd.type = CommandType::ROTATE_X; cmd.angle = angle;
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_rotate_y(float angle) {
+    RenderCommand cmd; cmd.type = CommandType::ROTATE_Y; cmd.angle = angle;
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_rotate_z(float angle) {
+    RenderCommand cmd; cmd.type = CommandType::ROTATE_Z; cmd.angle = angle;
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_scale(float x, float y, float z) {
+    RenderCommand cmd; cmd.type = CommandType::SCALE; cmd.vec3 = {x, y, z};
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_set_projection(float fov, float aspect, float near_z, float far_z) {
+    RenderCommand cmd; cmd.type = CommandType::SET_PROJECTION; 
+    cmd.perspective = {fov, aspect, near_z, far_z};
+    command_queue.push_back(cmd);
+}
+void SpheroidGPU::cmd_draw_mesh(uint32_t mesh_id, uint32_t tex_id) {
+    RenderCommand cmd; cmd.type = CommandType::DRAW_MESH; cmd.draw = {mesh_id, tex_id};
+    command_queue.push_back(cmd);
+}
+
+// =============================================================================
+// Execution Pipeline
+// =============================================================================
+
+void SpheroidGPU::flush_command_queue() {
+    screen_vertex_pool.clear();
+    triangle_pool.clear();
+    node_count = 0;
+
+    for (auto& tile : tiles) {
+        tile.opaque_head = 0xFFFFFFFF;
+        tile.punchthrough_head = 0xFFFFFFFF;
+        tile.translucent_head = 0xFFFFFFFF;
+    }
+
+    state.current_render_list = RenderListType::OPAQUE_LIST;
+    state.modelview_matrix = HMM_M4D(1.0f);
+    state.matrix_stack.clear();
+
+    for (const auto& cmd : command_queue) {
+        switch (cmd.type) {
+            case CommandType::CLEAR:
+                clear_color_val = cmd.clear_color; clear_depth_val = -1.0f; pending_clear = true; break;
+            case CommandType::SET_RENDER_LIST:
+                state.current_render_list = cmd.list_type; break;
+            case CommandType::PUSH_MATRIX:
+                state.matrix_stack.push_back(state.modelview_matrix); break;
+            case CommandType::POP_MATRIX:
+                if (!state.matrix_stack.empty()) { 
+                    state.modelview_matrix = state.matrix_stack.back(); 
+                    state.matrix_stack.pop_back(); 
+                } break;
+            case CommandType::LOAD_IDENTITY:
+                state.modelview_matrix = HMM_M4D(1.0f); break;
+            case CommandType::LOAD_MATRIX:
+                std::memcpy(&state.modelview_matrix, cmd.matrix.f, sizeof(float) * 16); break;
+            case CommandType::TRANSLATE:
+                state.modelview_matrix = state.modelview_matrix * HMM_Translate(HMM_V3(cmd.vec3.x, cmd.vec3.y, cmd.vec3.z)); break;
+            case CommandType::ROTATE_X:
+                state.modelview_matrix = state.modelview_matrix * HMM_Rotate_LH(cmd.angle, HMM_V3(1.0f, 0.0f, 0.0f)); break;
+            case CommandType::ROTATE_Y:
+                state.modelview_matrix = state.modelview_matrix * HMM_Rotate_LH(cmd.angle, HMM_V3(0.0f, 1.0f, 0.0f)); break;
+            case CommandType::ROTATE_Z:
+                state.modelview_matrix = state.modelview_matrix * HMM_Rotate_LH(cmd.angle, HMM_V3(0.0f, 0.0f, 1.0f)); break;
+            case CommandType::SCALE:
+                state.modelview_matrix = state.modelview_matrix * HMM_Scale(HMM_V3(cmd.vec3.x, cmd.vec3.y, cmd.vec3.z)); break;
+            case CommandType::SET_PROJECTION:
+                state.projection_matrix = HMM_Perspective_LH_ZO(cmd.perspective.fov, cmd.perspective.aspect, cmd.perspective.near_z, cmd.perspective.far_z); break;
+            
+            case CommandType::DRAW_MESH: {
+                if (cmd.draw.mesh_id == 0 || cmd.draw.mesh_id > meshes.size()) break;
+                
+                const MeshResource& mesh = meshes[cmd.draw.mesh_id - 1];
+
+                if (cmd.draw.tex_id > 0 && cmd.draw.tex_id <= textures.size()) {
+                    const TextureResource& tex = textures[cmd.draw.tex_id - 1];
+                    state.texturing_enabled = true;
+                    state.texture_ptr = tex.pixels.data();
+                    state.tex_width = tex.width;
+                    state.tex_height = tex.height;
+                } else {
+                    state.texturing_enabled = false;
+                    state.texture_ptr = nullptr;
+                }
+
+                HMM_Mat4 mvp = state.projection_matrix * state.modelview_matrix;
+
+                if (vertex_cache.size() < mesh.vertices.size()) {
+                    vertex_cache.resize(mesh.vertices.size());
+                }
+
+                for (size_t v = 0; v < mesh.vertices.size(); v++) {
+                    const GPUVertex& in = mesh.vertices[v];
+                    vertex_cache[v].pos = mvp * HMM_V4(in.x, in.y, in.z, 1.0f);
+                    vertex_cache[v].u = in.u; vertex_cache[v].v = in.v;
+                    vertex_cache[v].r = (float)in.r; vertex_cache[v].g = (float)in.g; 
+                    vertex_cache[v].b = (float)in.b; vertex_cache[v].a = (float)in.a; 
+                }
+
+                for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+                    process_clip_triangle(
+                        vertex_cache[mesh.indices[i]], 
+                        vertex_cache[mesh.indices[i+1]], 
+                        vertex_cache[mesh.indices[i+2]]
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    command_queue.clear();
+    flush_tiles();
+}
+
+// =============================================================================
+// Clipper & Rasterizer Math (Unchanged inner workings)
+// =============================================================================
 
 void SpheroidGPU::process_clip_triangle(const ClipVertex& in_v0, const ClipVertex& in_v1, const ClipVertex& in_v2) {
     ClipVertex in_verts[3] = { in_v0, in_v1, in_v2 };
@@ -99,136 +268,13 @@ void SpheroidGPU::process_clip_triangle(const ClipVertex& in_v0, const ClipVerte
             sv.y = (1.0f - ndc_y) * 0.5f * (float)height;
             sv.z = poly[v]->pos.Z * inv_w;
             sv.inv_w = inv_w;
-            sv.r = poly[v]->r * inv_w;
-            sv.g = poly[v]->g * inv_w;
-            sv.b = poly[v]->b * inv_w;
-            sv.a = poly[v]->a * inv_w; 
-            sv.u = poly[v]->u * inv_w;
-            sv.v = poly[v]->v * inv_w;
+            sv.r = poly[v]->r * inv_w; sv.g = poly[v]->g * inv_w;
+            sv.b = poly[v]->b * inv_w; sv.a = poly[v]->a * inv_w; 
+            sv.u = poly[v]->u * inv_w; sv.v = poly[v]->v * inv_w;
             screen_vertex_pool.push_back(sv);
         }
         bin_triangle(start_idx, start_idx + 1, start_idx + 2);
     }
-}
-
-void SpheroidGPU::execute_display_list(uint32_t ram_offset) {
-    if (!system_ram) return;
-    uint32_t ptr = ram_offset;
-    bool done = false;
-
-    screen_vertex_pool.clear();
-    triangle_pool.clear();
-    node_count = 0;
-
-    for (auto& tile : tiles) {
-        tile.opaque_head = 0xFFFFFFFF;
-        tile.punchthrough_head = 0xFFFFFFFF;
-        tile.translucent_head = 0xFFFFFFFF;
-    }
-
-    state.current_render_list = RenderListType::OPAQUE_LIST;
-
-    while (!done) {
-        uint32_t cmd = read_u32(system_ram, ptr);
-        ptr += 4;
-
-        switch (cmd) {
-            case 0x01: { 
-                clear_color_val = read_u32(system_ram, ptr); clear_depth_val = -1.0f;
-                pending_clear = true; ptr += 4; break;
-            }
-            case 0x02: { 
-                std::memcpy(&state.modelview_matrix, &system_ram[ptr], sizeof(HMM_Mat4)); ptr += 64; break;
-            }
-            case 0x03: { 
-                uint32_t tex_offset = read_u32(system_ram, ptr);
-                state.tex_width = read_u32(system_ram, ptr + 4); state.tex_height = read_u32(system_ram, ptr + 8);
-                if (tex_offset != 0) { state.texture_ptr = (uint32_t*)&system_ram[tex_offset]; state.texturing_enabled = true; } 
-                else { state.texture_ptr = nullptr; state.texturing_enabled = false; }
-                ptr += 12; break;
-            }
-            case 0x05: state.matrix_stack.push_back(state.modelview_matrix); break;
-            case 0x06: 
-                if (!state.matrix_stack.empty()) { state.modelview_matrix = state.matrix_stack.back(); state.matrix_stack.pop_back(); } break;
-            case 0x07: state.modelview_matrix = HMM_M4D(1.0f); break;
-            case 0x08: { 
-                float x = read_f32(system_ram, ptr); float y = read_f32(system_ram, ptr + 4); float z = read_f32(system_ram, ptr + 8);
-                state.modelview_matrix = state.modelview_matrix * HMM_Translate(HMM_V3(x, y, z)); ptr += 12; break;
-            }
-            case 0x09: { 
-                float angle = read_f32(system_ram, ptr); state.modelview_matrix = state.modelview_matrix * HMM_Rotate_LH(angle, HMM_V3(1.0f, 0.0f, 0.0f)); ptr += 4; break;
-            }
-            case 0x0A: { 
-                float angle = read_f32(system_ram, ptr); state.modelview_matrix = state.modelview_matrix * HMM_Rotate_LH(angle, HMM_V3(0.0f, 1.0f, 0.0f)); ptr += 4; break;
-            }
-            case 0x0B: { 
-                float x = read_f32(system_ram, ptr); float y = read_f32(system_ram, ptr + 4); float z = read_f32(system_ram, ptr + 8);
-                state.modelview_matrix = state.modelview_matrix * HMM_Scale(HMM_V3(x, y, z)); ptr += 12; break;
-            }
-            case 0x0C: { 
-                float fov = read_f32(system_ram, ptr); float aspect = read_f32(system_ram, ptr + 4);
-                float near_z = read_f32(system_ram, ptr + 8); float far_z = read_f32(system_ram, ptr + 12);
-                state.projection_matrix = HMM_Perspective_LH_ZO(fov, aspect, near_z, far_z); ptr += 16; break;
-            }
-            case 0x0D: { 
-                std::memcpy(&state.projection_matrix, &system_ram[ptr], sizeof(HMM_Mat4)); ptr += 64; break;
-            }
-            case 0x0E: { 
-                uint32_t list_type = read_u32(system_ram, ptr);
-                if (list_type <= 2) state.current_render_list = static_cast<RenderListType>(list_type);
-                ptr += 4; break;
-            }
-            case 0x04: { 
-                uint32_t v_offset = read_u32(system_ram, ptr);
-                uint32_t v_count  = read_u32(system_ram, ptr + 4);
-                ptr += 8;
-                HMM_Mat4 mvp = state.projection_matrix * state.modelview_matrix;
-
-                for (uint32_t i = 0; i < v_count; i += 3) {
-                    ClipVertex in_verts[3];
-                    for (int v = 0; v < 3; v++) {
-                        GPUVertex in; std::memcpy(&in, &system_ram[v_offset + (i + v) * sizeof(GPUVertex)], sizeof(GPUVertex));
-                        in_verts[v].pos = mvp * HMM_V4(in.x, in.y, in.z, 1.0f);
-                        in_verts[v].u = in.u; in_verts[v].v = in.v;
-                        in_verts[v].r = (float)in.r; in_verts[v].g = (float)in.g; in_verts[v].b = (float)in.b; in_verts[v].a = (float)in.a; 
-                    }
-                    process_clip_triangle(in_verts[0], in_verts[1], in_verts[2]);
-                }
-                break;
-            }
-            case 0x0F: { 
-                uint32_t v_offset = read_u32(system_ram, ptr);
-                uint32_t v_count  = read_u32(system_ram, ptr + 4);
-                uint32_t i_offset = read_u32(system_ram, ptr + 8);
-                uint32_t i_count  = read_u32(system_ram, ptr + 12);
-                ptr += 16;
-                
-                HMM_Mat4 mvp = state.projection_matrix * state.modelview_matrix;
-                
-                if (vertex_cache.size() < v_count) vertex_cache.resize(v_count);
-                for (uint32_t v = 0; v < v_count; v++) {
-                    GPUVertex in;
-                    std::memcpy(&in, &system_ram[v_offset + v * sizeof(GPUVertex)], sizeof(GPUVertex));
-                    vertex_cache[v].pos = mvp * HMM_V4(in.x, in.y, in.z, 1.0f);
-                    vertex_cache[v].u = in.u; vertex_cache[v].v = in.v;
-                    vertex_cache[v].r = (float)in.r; vertex_cache[v].g = (float)in.g; vertex_cache[v].b = (float)in.b; vertex_cache[v].a = (float)in.a; 
-                }
-
-                for (uint32_t i = 0; i < i_count; i += 3) {
-                    uint16_t idx0, idx1, idx2;
-                    std::memcpy(&idx0, &system_ram[i_offset + (i + 0) * sizeof(uint16_t)], sizeof(uint16_t));
-                    std::memcpy(&idx1, &system_ram[i_offset + (i + 1) * sizeof(uint16_t)], sizeof(uint16_t));
-                    std::memcpy(&idx2, &system_ram[i_offset + (i + 2) * sizeof(uint16_t)], sizeof(uint16_t));
-                    
-                    process_clip_triangle(vertex_cache[idx0], vertex_cache[idx1], vertex_cache[idx2]);
-                }
-                break;
-            }
-            case 0xFF: done = true; break;
-            default: done = true; break; 
-        }
-    }
-    flush_tiles();
 }
 
 void SpheroidGPU::bin_triangle(uint32_t v0_idx, uint32_t v1_idx, uint32_t v2_idx) {
@@ -239,7 +285,6 @@ void SpheroidGPU::bin_triangle(uint32_t v0_idx, uint32_t v1_idx, uint32_t v2_idx
     const int SUB_BITS = 4;
     const float SUB_MULT = 16.0f; 
 
-    // --- OPTIMIZATION: Removed slow std::round overhead ---
     int32_t x0 = (int32_t)(v0.x * SUB_MULT + 0.5f), y0 = (int32_t)(v0.y * SUB_MULT + 0.5f);
     int32_t x1 = (int32_t)(v1.x * SUB_MULT + 0.5f), y1 = (int32_t)(v1.y * SUB_MULT + 0.5f);
     int32_t x2 = (int32_t)(v2.x * SUB_MULT + 0.5f), y2 = (int32_t)(v2.y * SUB_MULT + 0.5f);
@@ -255,10 +300,8 @@ void SpheroidGPU::bin_triangle(uint32_t v0_idx, uint32_t v1_idx, uint32_t v2_idx
 
     if (minX >= (int)width || maxX < 0 || minY >= (int)height || maxY < 0) return;
 
-    int start_tx = minX / TILE_SIZE;
-    int end_tx   = maxX / TILE_SIZE;
-    int start_ty = minY / TILE_SIZE;
-    int end_ty   = maxY / TILE_SIZE;
+    int start_tx = minX / TILE_SIZE; int end_tx = maxX / TILE_SIZE;
+    int start_ty = minY / TILE_SIZE; int end_ty = maxY / TILE_SIZE;
 
     BinnedTriangle tri;
     tri.v0_idx = v0_idx; tri.v1_idx = v1_idx; tri.v2_idx = v2_idx;
@@ -275,8 +318,6 @@ void SpheroidGPU::bin_triangle(uint32_t v0_idx, uint32_t v1_idx, uint32_t v2_idx
     for (int ty = start_ty; ty <= end_ty; ty++) {
         for (int tx = start_tx; tx <= end_tx; tx++) {
             auto& tile = tiles[ty * num_tiles_x + tx];
-            
-            // --- OPTIMIZATION: Discard triangle if node arena is full rather than stuttering ---
             if (node_count >= node_arena.size()) return; 
             
             uint32_t n = node_count++;
@@ -300,11 +341,9 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
     const ScreenVertex& v2 = screen_vertex_pool[tri.v2_idx];
 
     const int SUB_BITS = 4;
-    const float SUB_MULT = 16.0f; 
-
-    int32_t x0 = (int32_t)(v0.x * SUB_MULT + 0.5f), y0 = (int32_t)(v0.y * SUB_MULT + 0.5f);
-    int32_t x1 = (int32_t)(v1.x * SUB_MULT + 0.5f), y1 = (int32_t)(v1.y * SUB_MULT + 0.5f);
-    int32_t x2 = (int32_t)(v2.x * SUB_MULT + 0.5f), y2 = (int32_t)(v2.y * SUB_MULT + 0.5f);
+    int32_t x0 = (int32_t)(v0.x * 16.0f + 0.5f), y0 = (int32_t)(v0.y * 16.0f + 0.5f);
+    int32_t x1 = (int32_t)(v1.x * 16.0f + 0.5f), y1 = (int32_t)(v1.y * 16.0f + 0.5f);
+    int32_t x2 = (int32_t)(v2.x * 16.0f + 0.5f), y2 = (int32_t)(v2.y * 16.0f + 0.5f);
 
     int32_t area = (x2 - x0) * (y1 - y0) - (y2 - y0) * (x1 - x0);
     if (area < 0) area = -area;
@@ -374,8 +413,6 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
             float inv_span = 1.0f / span_len;
             float inv_w_step_span = (inv_w_e - inv_w_s) * inv_span;
 
-            // --- OPTIMIZATION: 16.16 Fixed Point Conversion for Span variables ---
-            // Hoists floating point -> integer conversion out of the pixel loop!
             int32_t u_fixed = 0, v_fixed = 0, u_step_fixed = 0, v_step_fixed = 0;
             if constexpr (TEXTURED) {
                 u_fixed = (int32_t)(u_s * tri.tex_width * 65536.0f);
@@ -384,10 +421,8 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
                 v_step_fixed = (int32_t)((v_e - v_s) * tri.tex_height * inv_span * 65536.0f);
             }
 
-            int32_t r_fixed = (int32_t)(r_s * 65536.0f);
-            int32_t g_fixed = (int32_t)(g_s * 65536.0f);
-            int32_t b_fixed = (int32_t)(b_s * 65536.0f);
-            int32_t a_fixed = (int32_t)(a_s * 65536.0f);
+            int32_t r_fixed = (int32_t)(r_s * 65536.0f), g_fixed = (int32_t)(g_s * 65536.0f);
+            int32_t b_fixed = (int32_t)(b_s * 65536.0f), a_fixed = (int32_t)(a_s * 65536.0f);
             int32_t r_step_fixed = (int32_t)((r_e - r_s) * inv_span * 65536.0f);
             int32_t g_step_fixed = (int32_t)((g_e - g_s) * inv_span * 65536.0f);
             int32_t b_step_fixed = (int32_t)((b_e - b_s) * inv_span * 65536.0f);
@@ -402,14 +437,12 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
                     if constexpr (DEPTH_TEST) pass_depth = (cur_inv_w > local_depth[local_idx]);
 
                     if (pass_depth) {
-                        // Fast inline bitwise clamp bounds checking
                         int tr = std::max(0, std::min(255, r_fixed >> 16));
                         int tg = std::max(0, std::min(255, g_fixed >> 16));
                         int tb = std::max(0, std::min(255, b_fixed >> 16));
                         int ta = std::max(0, std::min(255, a_fixed >> 16));
                         
                         if constexpr (TEXTURED) {
-                            // --- OPTIMIZATION: Fix Texture Wrapping Bug with std::clamp instead of bitwise mask ---
                             int tx = std::max(0, std::min((int)tri.tex_width - 1, u_fixed >> 16));
                             int ty = std::max(0, std::min((int)tri.tex_height - 1, v_fixed >> 16));
                             uint32_t texel = tri.texture_ptr[ty * tri.tex_width + tx];
@@ -431,7 +464,6 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
                             }
                             if constexpr (LIST_TYPE == RenderListType::TRANSLUCENT_LIST) {
                                 uint32_t bg = local_color[local_idx];
-                                // Optimized blending via shifts instead of divisions
                                 tr = (tr * ta + ((bg >> 16) & 0xFF) * (255 - ta)) >> 8;
                                 tg = (tg * ta + ((bg >> 8) & 0xFF) * (255 - ta)) >> 8;
                                 tb = (tb * ta + (bg & 0xFF) * (255 - ta)) >> 8;
@@ -441,7 +473,6 @@ void SpheroidGPU::rasterize_binned_impl(const BinnedTriangle& tri, int tile_min_
                     }
                 }
                 
-                // Advance fixed point variables
                 if constexpr (TEXTURED) { u_fixed += u_step_fixed; v_fixed += v_step_fixed; }
                 r_fixed += r_step_fixed; g_fixed += g_step_fixed; 
                 b_fixed += b_step_fixed; a_fixed += a_step_fixed;
@@ -477,10 +508,6 @@ void SpheroidGPU::rasterize_binned(const BinnedTriangle& tri, int min_x, int min
 
 void SpheroidGPU::process_tiles_loop() {
     int total_tiles = num_tiles_x * num_tiles_y;
-    
-    // --- OPTIMIZATION: thread_local removed! 
-    // Creating these on standard stack memory provides guaranteed L1 cache hits 
-    // and eliminates the TLS lookup overhead per loop iteration. ---
     uint32_t local_color[TILE_SIZE * TILE_SIZE];
     float local_depth[TILE_SIZE * TILE_SIZE];
 
@@ -512,9 +539,7 @@ void SpheroidGPU::process_tiles_loop() {
             curr = node_arena[curr].next;
         }
 
-        // Keep sort_buf on thread stack for translucent sorting
         std::vector<uint32_t> sort_buf;
-
         curr = tiles[tile_idx].translucent_head;
         while (curr != 0xFFFFFFFF) {
             sort_buf.push_back(node_arena[curr].tri_idx);
@@ -523,7 +548,6 @@ void SpheroidGPU::process_tiles_loop() {
 
         std::sort(sort_buf.begin(), sort_buf.end(), [this](uint32_t a_idx, uint32_t b_idx) {
             const BinnedTriangle& a = triangle_pool[a_idx]; const BinnedTriangle& b = triangle_pool[b_idx];
-            // Lookup from screen pool using indices
             float a_w = screen_vertex_pool[a.v0_idx].inv_w + screen_vertex_pool[a.v1_idx].inv_w + screen_vertex_pool[a.v2_idx].inv_w;
             float b_w = screen_vertex_pool[b.v0_idx].inv_w + screen_vertex_pool[b.v1_idx].inv_w + screen_vertex_pool[b.v2_idx].inv_w;
             return a_w < b_w;

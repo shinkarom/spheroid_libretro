@@ -33,8 +33,6 @@ struct ClipVertex {
     float r, g, b, a; 
 };
 
-// --- OPTIMIZATION: BinnedTriangle is now extremely compact (approx 32 bytes) ---
-// It stores indices instead of full 40-byte vertex copies, massively improving cache hits.
 struct BinnedTriangle {
     uint32_t v0_idx, v1_idx, v2_idx;
     int16_t minX, minY, maxX, maxY;
@@ -42,7 +40,7 @@ struct BinnedTriangle {
     bool texturing_enabled;
     bool depth_test_enabled;
     uint16_t tex_width, tex_height;
-    uint32_t* texture_ptr;
+    const uint32_t* texture_ptr;
 };
 
 struct TriNode {
@@ -59,7 +57,7 @@ struct Tile {
 struct GPUState {
     bool depth_test_enabled = true;
     bool backface_culling = true;
-    uint32_t* texture_ptr = nullptr;
+    const uint32_t* texture_ptr = nullptr;
     uint32_t tex_width = 0;
     uint32_t tex_height = 0;
     bool texturing_enabled = false;
@@ -69,19 +67,58 @@ struct GPUState {
     std::vector<HMM_Mat4> matrix_stack;         
 };
 
+// --- NEW: Hardware Resources ---
+struct TextureResource {
+    uint32_t width;
+    uint32_t height;
+    std::vector<uint32_t> pixels; // XRGB8888 or RGBA8888
+};
+
+struct MeshResource {
+    std::vector<GPUVertex> vertices;
+    std::vector<uint16_t> indices;
+};
+
+// --- NEW: Command Queue Structures ---
+enum class CommandType : uint8_t {
+    CLEAR,
+    SET_RENDER_LIST,
+    PUSH_MATRIX,
+    POP_MATRIX,
+    LOAD_IDENTITY,
+    LOAD_MATRIX,
+    TRANSLATE,
+    ROTATE_X,
+    ROTATE_Y,
+    ROTATE_Z,
+    SCALE,
+    SET_PROJECTION,
+    DRAW_MESH
+};
+
+struct RenderCommand {
+    CommandType type;
+    union {
+        uint32_t clear_color;
+        RenderListType list_type;
+        struct { uint32_t mesh_id; uint32_t tex_id; } draw;
+        struct { float f[16]; } matrix;
+        struct { float x, y, z; } vec3;
+        float angle;
+        struct { float fov, aspect, near_z, far_z; } perspective;
+    };
+};
+
 class SpheroidGPU {
 private:
     uint32_t width, height;
     uint32_t* color_buffer;
-    float* depth_buffer;
-    uint8_t* system_ram;
     GPUState state;
     
     static const int TILE_SIZE = 32; 
     int num_tiles_x, num_tiles_y;
     std::vector<Tile> tiles;
     
-    // --- NEW: Global pool for generated screen vertices ---
     std::vector<ScreenVertex> screen_vertex_pool;
     std::vector<BinnedTriangle> triangle_pool;
     std::vector<TriNode> node_arena;
@@ -93,6 +130,11 @@ private:
     uint32_t clear_color_val;
     float clear_depth_val;
 
+    // --- VRAM and Command Queue ---
+    std::vector<TextureResource> textures;
+    std::vector<MeshResource> meshes;
+    std::vector<RenderCommand> command_queue;
+
     std::vector<std::thread> workers;
     std::atomic<int> current_tile;
     std::atomic<int> completed_tiles;
@@ -102,8 +144,6 @@ private:
     std::condition_variable cv_done; 
 
     void process_clip_triangle(const ClipVertex& v0, const ClipVertex& v1, const ClipVertex& v2);
-
-    // --- OPTIMIZATION: bin_triangle now takes indices to save memory bandwidth ---
     void bin_triangle(uint32_t v0_idx, uint32_t v1_idx, uint32_t v2_idx);
     void flush_tiles();
     
@@ -124,8 +164,28 @@ public:
 
     void init(uint32_t w, uint32_t h);
     void shutdown();
-    void set_ram_pointer(uint8_t* ram);
     const uint32_t* get_framebuffer() const;
     
-    void execute_display_list(uint32_t ram_offset);
+    // --- JS Bridge: Resource Loading ---
+    // Returns 1-based IDs. 0 means invalid/untextured.
+    uint32_t load_texture(uint32_t w, uint32_t h, const uint32_t* pixels);
+    uint32_t load_mesh(const std::vector<GPUVertex>& verts, const std::vector<uint16_t>& indices);
+
+    // --- JS Bridge: Command List Builder ---
+    void cmd_clear(uint32_t color);
+    void cmd_set_render_list(RenderListType type);
+    void cmd_push_matrix();
+    void cmd_pop_matrix();
+    void cmd_load_identity();
+    void cmd_load_matrix(const HMM_Mat4& mat);
+    void cmd_translate(float x, float y, float z);
+    void cmd_rotate_x(float angle);
+    void cmd_rotate_y(float angle);
+    void cmd_rotate_z(float angle);
+    void cmd_scale(float x, float y, float z);
+    void cmd_set_projection(float fov, float aspect, float near_z, float far_z);
+    void cmd_draw_mesh(uint32_t mesh_id, uint32_t tex_id);
+
+    // --- Execution ---
+    void flush_command_queue();
 };
