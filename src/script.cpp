@@ -293,9 +293,25 @@ bool SpheroidScript::init(uint8_t* ram_ptr, size_t ram_size, VFSManager* vfs_mgr
     // 4. System.input
     JSValue input_obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, input_obj, "pressed",     JS_NewCFunction(ctx, js_input_pressed, "pressed", 2));
+	JS_SetPropertyStr(ctx, input_obj, "justPressed", JS_NewCFunction(ctx, js_input_just_pressed, "justPressed", 2));
+    JS_SetPropertyStr(ctx, input_obj, "justReleased", JS_NewCFunction(ctx, js_input_just_released, "justReleased", 2));
     JS_SetPropertyStr(ctx, input_obj, "getPadState", JS_NewCFunction(ctx, js_input_get_pad_state, "getPadState", 1));
-    JS_SetPropertyStr(ctx, input_obj, "B", JS_NewInt32(ctx, 1<<0));
-    JS_SetPropertyStr(ctx, input_obj, "UP", JS_NewInt32(ctx, 1<<4)); // (Add rest of inputs here later for brevity)
+    JS_SetPropertyStr(ctx, input_obj, "B",      JS_NewInt32(ctx, 1 << 0));
+    JS_SetPropertyStr(ctx, input_obj, "Y",      JS_NewInt32(ctx, 1 << 1));
+    JS_SetPropertyStr(ctx, input_obj, "SELECT", JS_NewInt32(ctx, 1 << 2));
+    JS_SetPropertyStr(ctx, input_obj, "START",  JS_NewInt32(ctx, 1 << 3));
+    JS_SetPropertyStr(ctx, input_obj, "UP",     JS_NewInt32(ctx, 1 << 4));
+    JS_SetPropertyStr(ctx, input_obj, "DOWN",   JS_NewInt32(ctx, 1 << 5));
+    JS_SetPropertyStr(ctx, input_obj, "LEFT",   JS_NewInt32(ctx, 1 << 6));
+    JS_SetPropertyStr(ctx, input_obj, "RIGHT",  JS_NewInt32(ctx, 1 << 7));
+    JS_SetPropertyStr(ctx, input_obj, "A",      JS_NewInt32(ctx, 1 << 8));
+    JS_SetPropertyStr(ctx, input_obj, "X",      JS_NewInt32(ctx, 1 << 9));
+    JS_SetPropertyStr(ctx, input_obj, "L",      JS_NewInt32(ctx, 1 << 10));
+    JS_SetPropertyStr(ctx, input_obj, "R",      JS_NewInt32(ctx, 1 << 11));
+    JS_SetPropertyStr(ctx, input_obj, "L2",     JS_NewInt32(ctx, 1 << 12));
+    JS_SetPropertyStr(ctx, input_obj, "R2",     JS_NewInt32(ctx, 1 << 13));
+    JS_SetPropertyStr(ctx, input_obj, "L3",     JS_NewInt32(ctx, 1 << 14));
+    JS_SetPropertyStr(ctx, input_obj, "R3",     JS_NewInt32(ctx, 1 << 15));
     JS_SetPropertyStr(ctx, system_obj, "input", input_obj);
 
     // =========================================================================
@@ -573,6 +589,7 @@ void SpheroidScript::call_update() {
 // =============================================================================
 void SpheroidScript::update_inputs(const uint16_t* pad_states) {
     for (int i = 0; i < 4; i++) {
+		previous_pad_state[i] = current_pad_state[i];
         current_pad_state[i] = pad_states[i];
     }
 }
@@ -590,6 +607,38 @@ JSValue SpheroidScript::js_input_pressed(JSContext *ctx, JSValueConst this_val, 
     // We now use the mask directly!
     bool is_pressed = (script->current_pad_state[port] & button_mask) == button_mask;
     return JS_NewBool(ctx, is_pressed);
+}
+
+JSValue SpheroidScript::js_input_just_pressed(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    if (!script) return JS_FALSE;
+
+    int32_t port, button_mask;
+    JS_ToInt32(ctx, &port, argv[0]);
+    JS_ToInt32(ctx, &button_mask, argv[1]);
+
+    if (port < 0 || port >= 4) return JS_FALSE;
+
+    bool curr = (script->current_pad_state[port] & button_mask) == button_mask;
+    bool prev = (script->previous_pad_state[port] & button_mask) == button_mask;
+    
+    return JS_NewBool(ctx, curr && !prev);
+}
+
+JSValue SpheroidScript::js_input_just_released(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    SpheroidScript* script = static_cast<SpheroidScript*>(JS_GetContextOpaque(ctx));
+    if (!script) return JS_FALSE;
+
+    int32_t port, button_mask;
+    JS_ToInt32(ctx, &port, argv[0]);
+    JS_ToInt32(ctx, &button_mask, argv[1]);
+
+    if (port < 0 || port >= 4) return JS_FALSE;
+
+    bool curr = (script->current_pad_state[port] & button_mask) == button_mask;
+    bool prev = (script->previous_pad_state[port] & button_mask) == button_mask;
+    
+    return JS_NewBool(ctx, !curr && prev);
 }
 
 // NEW: Expose the raw 16-bit hardware register

@@ -47,6 +47,7 @@ private:
     uint8_t* system_ram = nullptr;
     size_t system_ram_size = 0;
     uint16_t current_pad_state[4] = {0};
+	uint16_t previous_pad_state[4] = {0};
 
     void print_js_exception();
 
@@ -69,6 +70,8 @@ private:
     // Native JS Input Bindings
     static JSValue js_input_pressed(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
     static JSValue js_input_get_pad_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+	static JSValue js_input_just_pressed(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+    static JSValue js_input_just_released(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 	
     // Native JS Audio Bindings
     static JSValue js_audio_load(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
